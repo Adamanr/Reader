@@ -56,7 +56,7 @@
     flex-wrap: wrap;
   }
 
-  .row :global(.theme-select) {
+  .row :global(.theme-select-shell) {
     width: 100%;
     max-width: none;
   }

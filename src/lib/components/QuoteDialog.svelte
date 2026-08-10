@@ -8,6 +8,7 @@
   } from "$lib/quoteCardStyles";
   import { copyQuotePngToClipboard } from "$lib/quoteToPng";
   import { resizeImageFileToJpegDataUrl } from "$lib/resizeImageDataUrl";
+  import DreamSelect from "$lib/components/DreamSelect.svelte";
 
   interface Props {
     open: boolean;
@@ -36,6 +37,7 @@
   let includeChapter = $state(false);
   let editTitle = $state("");
   let editAuthor = $state("");
+  let editQuoteText = $state("");
   let copyBusy = $state(false);
   let copyToast = $state<{ ok: boolean; text: string } | null>(null);
 
@@ -52,6 +54,7 @@
     if (open) {
       editTitle = bookTitle;
       editAuthor = bookAuthor;
+      editQuoteText = quoteText;
       copyToast = null;
       bgImageDataUrl = null;
       bgImageOpacityPct = 100;
@@ -82,6 +85,7 @@
 
   function draftOptions(): QuoteDraftOptions {
     return {
+      text: editQuoteText.trim(),
       accent,
       layout,
       includePage,
@@ -98,8 +102,22 @@
   }
 
   function save() {
+    if (!editQuoteText.trim()) return;
     onSave(draftOptions());
     onClose();
+  }
+
+  function joinWrappedLines() {
+    editQuoteText = editQuoteText
+      .trim()
+      .split(/\n\s*\n/)
+      .map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").replace(/[ \t]{2,}/g, " ").trim())
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  function restoreQuoteText() {
+    editQuoteText = quoteText;
   }
 
   async function onPickFile(e: Event) {
@@ -123,11 +141,15 @@
 
   async function copyPng() {
     copyToast = null;
+    if (!editQuoteText.trim()) {
+      copyToast = { ok: false, text: "Добавьте текст цитаты" };
+      return;
+    }
     copyBusy = true;
     try {
       const o = draftOptions();
       await copyQuotePngToClipboard({
-        quoteText,
+        quoteText: editQuoteText.trim(),
         bookTitle: editTitle.trim() || "Без названия",
         bookAuthor: editAuthor.trim(),
         pageLabel,
@@ -210,7 +232,7 @@
                     ></div>
                   {/if}
                   <div class="qp-front">
-                    <p class="quote-text" style:color={ACCENT_QUOTE_COLOR[accent]}>{quoteText}</p>
+                    <p class="quote-text" style:color={ACCENT_QUOTE_COLOR[accent]}>{editQuoteText}</p>
                     <footer class="quote-meta">
                       <span class="qt">{editTitle.trim() || "Без названия"}</span>
                       {#if editAuthor.trim()}
@@ -234,7 +256,7 @@
               type="button"
               class="btn-copy"
               onclick={() => void copyPng()}
-              disabled={copyBusy}
+              disabled={copyBusy || !editQuoteText.trim()}
             >
               <span class="btn-copy-icon" aria-hidden="true">⎘</span>
               {copyBusy ? "Копируем…" : "Скопировать PNG"}
@@ -249,6 +271,24 @@
 
         <aside class="controls-pane" aria-label="Настройки карточки">
           <div class="settings-stack">
+            <section class="settings-block quote-copy-block">
+              <h4 class="sec-kicker">Текст цитаты</h4>
+              <label class="inp">
+                <span class="inp-label">Можно исправить переносы, опечатки и пунктуацию</span>
+                <textarea
+                  class="quote-editor"
+                  rows="6"
+                  bind:value={editQuoteText}
+                  placeholder="Текст цитаты…"
+                ></textarea>
+              </label>
+              <div class="text-tools">
+                <button type="button" class="btn-text" onclick={joinWrappedLines}>Склеить строки</button>
+                <button type="button" class="btn-text" onclick={restoreQuoteText}>Вернуть исходный</button>
+                <span class="text-count">{editQuoteText.trim().length} символов</span>
+              </div>
+            </section>
+
             <section class="settings-block">
               <h4 class="sec-kicker">Подпись</h4>
               <label class="inp">
@@ -341,14 +381,16 @@
                 <input type="range" min="8" max="100" bind:value={bgImageOpacityPct} />
               </label>
 
-              <label class="inp">
+              <div class="inp">
                 <span class="inp-label">Как вписать</span>
-                <select class="sel" bind:value={bgFit}>
-                  {#each fits as f (f.value)}
-                    <option value={f.value}>{f.label}</option>
-                  {/each}
-                </select>
-              </label>
+                <DreamSelect
+                  value={bgFit}
+                  options={fits}
+                  ariaLabel="Как вписать фон"
+                  compact
+                  onChange={(value) => (bgFit = value as QuoteBgFit)}
+                />
+              </div>
 
               <label class="inp">
                 <span class="inp-label range-label">
@@ -376,7 +418,9 @@
 
       <footer class="ft">
         <button type="button" class="btn ghost-ft" onclick={onClose}>Отмена</button>
-        <button type="button" class="btn primary" onclick={save}>Сохранить в заметки</button>
+        <button type="button" class="btn primary" onclick={save} disabled={!editQuoteText.trim()}>
+          Сохранить в заметки
+        </button>
       </footer>
     </div>
   </div>
@@ -772,7 +816,7 @@
   }
 
   .inp input[type="text"],
-  .sel {
+  .quote-editor {
     padding: 0.55rem 0.65rem;
     border-radius: 10px;
     border: 1px solid var(--border-soft);
@@ -785,7 +829,7 @@
   }
 
   .inp input[type="text"]:focus,
-  .sel:focus {
+  .quote-editor:focus {
     outline: none;
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
@@ -798,18 +842,27 @@
     cursor: pointer;
   }
 
-  .sel {
-    cursor: pointer;
-    appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%238a817a' d='M1 1.5L6 6l5-4.5'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 0.65rem center;
-    padding-right: 2rem;
+  .quote-editor {
+    width: 100%;
+    min-height: 8rem;
+    resize: vertical;
+    line-height: 1.55;
+    font-family: Georgia, "Times New Roman", serif;
+    box-sizing: border-box;
   }
 
-  .sel option {
-    background-color: var(--panel-elevated);
-    color: var(--text-soft);
+  .text-tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem 0.7rem;
+  }
+
+  .text-count {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 0.66rem;
+    font-variant-numeric: tabular-nums;
   }
 
   .inp-hint {
@@ -1079,5 +1132,94 @@
 
   .btn.primary:hover {
     filter: brightness(1.03);
+  }
+
+  .btn:disabled {
+    opacity: 0.48;
+    cursor: default;
+    filter: none;
+  }
+
+  @media (max-width: 600px) {
+    .backdrop {
+      padding: 0;
+    }
+
+    .dlg {
+      width: 100%;
+      height: 100dvh;
+      max-height: 100dvh;
+      border: 0;
+      border-radius: 0;
+    }
+
+    .hd {
+      padding:
+        max(0.7rem, env(safe-area-inset-top))
+        max(0.8rem, env(safe-area-inset-right))
+        0.7rem
+        max(0.8rem, env(safe-area-inset-left));
+    }
+
+    .hd-mark,
+    .hd-sub {
+      display: none;
+    }
+
+    .hd-text h3 {
+      font-size: 1.05rem;
+    }
+
+    .x {
+      width: 2.75rem;
+      height: 2.75rem;
+    }
+
+    .studio {
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .preview-pane {
+      gap: 0.55rem;
+      padding: 0.75rem;
+    }
+
+    .preview-frame {
+      min-height: 10rem;
+      max-height: 45dvh;
+      padding: 0.55rem;
+    }
+
+    .qp-front {
+      padding: 1rem;
+    }
+
+    .controls-pane {
+      overflow: visible;
+      padding: 0.45rem 0.85rem 0.85rem;
+    }
+
+    .accent-chip,
+    .layout-btn,
+    .btn-file,
+    .btn-copy {
+      min-height: 2.75rem;
+    }
+
+    .ft {
+      gap: 0.45rem;
+      padding:
+        0.65rem
+        max(0.75rem, env(safe-area-inset-right))
+        max(0.65rem, env(safe-area-inset-bottom))
+        max(0.75rem, env(safe-area-inset-left));
+    }
+
+    .ft .btn {
+      flex: 1;
+      min-height: 2.75rem;
+      padding-inline: 0.55rem;
+    }
   }
 </style>

@@ -5,11 +5,11 @@ export type ThemeId = "light" | "dark" | "sepia" | "forest" | "ocean";
 export const THEME_STORAGE = "reader-theme";
 
 export const THEMES: { id: ThemeId; label: string }[] = [
-  { id: "light", label: "Светлая" },
-  { id: "dark", label: "Тёмная" },
-  { id: "sepia", label: "Сепия" },
-  { id: "forest", label: "Лес" },
-  { id: "ocean", label: "Океан" },
+  { id: "light", label: "Сон в облаках" },
+  { id: "dark", label: "Полночь" },
+  { id: "sepia", label: "Розовый закат" },
+  { id: "forest", label: "Тихий сад" },
+  { id: "ocean", label: "Утреннее небо" },
 ];
 
 export function isThemeId(v: string | null): v is ThemeId {

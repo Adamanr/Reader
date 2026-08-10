@@ -1,6 +1,7 @@
 <script lang="ts">
   import { browser } from "$app/environment";
   import { THEMES, type ThemeId, applyTheme, getStoredTheme } from "$lib/theme";
+  import DreamSelect from "$lib/components/DreamSelect.svelte";
 
   interface Props {
     /** В карточке настроек — подпись всегда видна, селектор на всю ширину */
@@ -10,8 +11,7 @@
 
   let value = $state<ThemeId>(browser ? getStoredTheme() : "light");
 
-  function onChange(e: Event) {
-    const v = (e.currentTarget as HTMLSelectElement).value;
+  function onChange(v: string) {
     if (THEMES.some((t) => t.id === v)) {
       const id = v as ThemeId;
       applyTheme(id);
@@ -20,18 +20,22 @@
   }
 </script>
 
-<label
+<div
   class="theme-wrap"
   class:card={variant === "card"}
   title="Тема оформления"
 >
   <span class="theme-label" class:always={variant === "card"}>Тема</span>
-  <select class="theme-select" {value} onchange={onChange}>
-    {#each THEMES as t (t.id)}
-      <option value={t.id}>{t.label}</option>
-    {/each}
-  </select>
-</label>
+  <span class="theme-select-shell">
+    <DreamSelect
+      {value}
+      options={THEMES.map((theme) => ({ value: theme.id, label: theme.label }))}
+      ariaLabel="Тема оформления"
+      compact={variant === "inline"}
+      onChange={onChange}
+    />
+  </span>
+</div>
 
 <style>
   .theme-wrap {
@@ -60,25 +64,15 @@
     }
   }
 
-  .theme-select {
-    padding: 0.38rem 1.75rem 0.38rem 0.5rem;
-    border-radius: var(--radius-md, 12px);
-    border: 1px solid var(--border-soft);
-    background-color: var(--elevated-soft);
-    color: var(--text-soft);
-    font-size: 0.78rem;
-    font-weight: 550;
-    cursor: pointer;
+  .theme-select-shell {
+    position: relative;
+    display: inline-block;
     max-width: 11rem;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%238a817a' d='M1 1.5L6 6l5-4.5'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 0.5rem center;
+    width: 100%;
   }
 
-  .theme-select:focus {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
+  .card .theme-select-shell {
+    max-width: none;
   }
+
 </style>

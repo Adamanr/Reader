@@ -44,6 +44,8 @@ export interface SavedQuote {
 }
 
 export interface QuoteDraftOptions {
+  /** Текст после правки в редакторе карточки. */
+  text: string;
   accent: QuoteAccent;
   layout: QuoteLayout;
   includePage: boolean;
@@ -60,6 +62,8 @@ export interface QuoteDraftOptions {
 
 export interface BookMeta {
   path: string;
+  /** Скрыта из основной библиотеки, но остаётся на диске. */
+  hidden?: boolean;
   /** Основная полка (для совместимости и сортировки). */
   shelfId: string;
   /** Книга может быть на нескольких полках; если пусто — только `shelfId`. */
@@ -97,6 +101,7 @@ export interface LibraryMetadata {
 export interface LibrarySnapshot {
   libraryRoot: string | null;
   bookPaths: string[];
+  hiddenBookPaths: string[];
   metadata: LibraryMetadata;
   /** Общий стиль Typst по умолчанию (путь относительно корня библиотеки). */
   defaultTypstStyleRelativePath?: string | null;
@@ -112,6 +117,17 @@ export const IMPORTANCE_OPTIONS: { value: Importance; label: string }[] = [
 export interface PdfOutlineItem {
   title: string;
   page: number | null;
+  /** Уровень заголовка в дереве PDF, начиная с 0. */
+  level: number;
+}
+
+export interface ReaderOutlineItem {
+  id: string;
+  label: string;
+  /** Исходный уровень заголовка; компонент сам нормализует первый уровень. */
+  level: number;
+  meta?: string;
+  disabled?: boolean;
 }
 
 export interface PdfReadyInfo {
@@ -120,7 +136,7 @@ export interface PdfReadyInfo {
 }
 
 export interface EpubReaderApi {
-  toc: { label: string; href: string }[];
+  toc: { label: string; href: string; level: number }[];
   spine: { label: string; href: string }[];
   goTo: (href: string) => Promise<void>;
   prev: () => Promise<void>;

@@ -6,6 +6,8 @@ export interface Fb2Section {
   anchor: string;
   title: string;
   html: string;
+  /** Вложенность исходной секции FB2, начиная с 0. */
+  level: number;
 }
 
 export interface ParsedFb2 {
@@ -148,7 +150,12 @@ function walkTableChildren(el: Element, binaries: Map<string, string>): string {
   return s;
 }
 
-function parseSectionTree(section: Element, binaries: Map<string, string>, idCounter: { i: number }): Fb2Section[] {
+function parseSectionTree(
+  section: Element,
+  binaries: Map<string, string>,
+  idCounter: { i: number },
+  level = 0,
+): Fb2Section[] {
   const titleEl = [...section.children].find((c) => c.localName === "title");
   const titleText = titleEl ? extractTitleFromTitleEl(titleEl) : "";
 
@@ -163,7 +170,7 @@ function parseSectionTree(section: Element, binaries: Map<string, string>, idCou
   const combined = directHtml.join("");
   if (nested.length && !combined.trim() && !titleText) {
     const out: Fb2Section[] = [];
-    for (const n of nested) out.push(...parseSectionTree(n, binaries, idCounter));
+    for (const n of nested) out.push(...parseSectionTree(n, binaries, idCounter, level));
     return out;
   }
 
@@ -173,10 +180,11 @@ function parseSectionTree(section: Element, binaries: Map<string, string>, idCou
       anchor: `fb2-${idCounter.i++}`,
       title: titleText || "Раздел",
       html: combined,
+      level,
     });
   }
   for (const n of nested) {
-    out.push(...parseSectionTree(n, binaries, idCounter));
+    out.push(...parseSectionTree(n, binaries, idCounter, level + 1));
   }
   return out;
 }
@@ -186,7 +194,7 @@ function parseBody(body: Element, binaries: Map<string, string>): Fb2Section[] {
   const out: Fb2Section[] = [];
   for (const ch of body.children) {
     if (ch.localName === "section") {
-      out.push(...parseSectionTree(ch, binaries, idCounter));
+      out.push(...parseSectionTree(ch, binaries, idCounter, 0));
     } else {
       const html = elementToHtml(ch, binaries);
       if (html.trim()) {
@@ -194,6 +202,7 @@ function parseBody(body: Element, binaries: Map<string, string>): Fb2Section[] {
           anchor: `fb2-${idCounter.i++}`,
           title: "",
           html,
+          level: 0,
         });
       }
     }
@@ -203,6 +212,7 @@ function parseBody(body: Element, binaries: Map<string, string>): Fb2Section[] {
       anchor: "fb2-0",
       title: "Текст",
       html: `<p class="fb2-p">${escapeHtml("Не удалось разобрать секции книги.")}</p>`,
+      level: 0,
     });
   }
   return out;

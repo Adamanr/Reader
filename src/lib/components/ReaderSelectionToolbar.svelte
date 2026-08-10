@@ -70,4 +70,28 @@
   .tbtn.accent:hover {
     filter: brightness(1.05);
   }
+
+  @media (max-width: 600px) {
+    .tb {
+      left: max(0.5rem, env(safe-area-inset-left)) !important;
+      right: max(0.5rem, env(safe-area-inset-right));
+      top: auto !important;
+      bottom: max(0.55rem, env(safe-area-inset-bottom));
+      width: auto;
+      max-width: none;
+      margin: 0;
+      padding: 0.25rem;
+      transform: none;
+      border-radius: 1rem;
+    }
+
+    .tbtn {
+      flex: 1;
+      min-width: 0;
+      min-height: 2.75rem;
+      padding-inline: 0.4rem;
+      white-space: normal;
+      line-height: 1.15;
+    }
+  }
 </style>

@@ -12,6 +12,7 @@
     exportTranslatedPdfToChosenFile,
     exportTranslatedPdfToLibrary,
   } from "$lib/pdf/exportTranslatedPdf";
+  import DreamSelect from "$lib/components/DreamSelect.svelte";
 
   interface Props {
     bookPath: string;
@@ -295,21 +296,23 @@
         <input type="text" bind:value={baseUrl} placeholder={LM_DEFAULT} />
       </label>
 
-      <label class="field">
+      <div class="field">
         <span>Модель</span>
         {#if models.length > 0}
-          <select bind:value={model}>
-            {#each models as m (m)}
-              <option value={m}>{m}</option>
-            {/each}
-          </select>
+          <DreamSelect
+            value={model}
+            options={models.map((name) => ({ value: name, label: name }))}
+            ariaLabel="Модель перевода"
+            placeholder="Выберите модель…"
+            onChange={(value) => (model = value)}
+          />
         {:else}
           <input type="text" bind:value={model} placeholder="Например llama3.2 / mistral" />
         {/if}
         {#if modelsErr}
           <span class="field-err">{modelsErr}</span>
         {/if}
-      </label>
+      </div>
 
       <div class="grid2">
         <label class="field">
@@ -502,8 +505,7 @@
   .field span {
     color: var(--muted, #9aa3b2);
   }
-  .field input,
-  .field select {
+  .field input {
     padding: 0.45rem 0.55rem;
     border-radius: 8px;
     border: 1px solid var(--border-soft, #334);
@@ -654,5 +656,48 @@
     font-size: 0.88rem;
     margin: 0.5rem 0 0;
     line-height: 1.45;
+  }
+
+  @media (max-width: 600px) {
+    .modal-back {
+      align-items: flex-end;
+      padding: 0;
+    }
+
+    .modal {
+      width: 100%;
+      max-height: 100dvh;
+      min-height: min(100dvh, 36rem);
+      padding:
+        0
+        max(0.9rem, env(safe-area-inset-right))
+        max(0.9rem, env(safe-area-inset-bottom))
+        max(0.9rem, env(safe-area-inset-left));
+      border-right: 0;
+      border-bottom: 0;
+      border-left: 0;
+      border-radius: 1.35rem 1.35rem 0 0;
+    }
+
+    .modal-h {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--elevated-soft);
+    }
+
+    .modal-x,
+    .btn,
+    .field input {
+      min-height: 2.75rem;
+    }
+
+    .modal-f {
+      flex-direction: column;
+    }
+
+    .modal-f .btn {
+      width: 100%;
+    }
   }
 </style>

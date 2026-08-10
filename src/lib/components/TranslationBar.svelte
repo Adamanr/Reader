@@ -1,5 +1,6 @@
 <script lang="ts">
   import { LANG_SOURCE, LANG_TARGET } from "$lib/translate/settings";
+  import DreamSelect from "$lib/components/DreamSelect.svelte";
 
   interface Props {
     /** fb2 — режим двух колонок; epub/pdf — только подпись в UI */
@@ -36,33 +37,29 @@
 
 <div class="trans-bar" class:compact role="region" aria-label="Перевод книги">
   <div class="trans-row">
-    <label class="mini-field">
+    <div class="mini-field">
       <span>С языка</span>
-      <select
-        class="mini-select"
+      <DreamSelect
         value={sourceLang}
-        onchange={(e) => onSourceChange((e.currentTarget as HTMLSelectElement).value)}
+        options={LANG_SOURCE.map((language) => ({ value: language.code, label: language.label }))}
+        ariaLabel="Исходный язык"
+        onChange={onSourceChange}
         disabled={busy}
-      >
-        {#each LANG_SOURCE as L (L.code)}
-          <option value={L.code}>{L.label}</option>
-        {/each}
-      </select>
-    </label>
+        compact
+      />
+    </div>
 
-    <label class="mini-field">
+    <div class="mini-field">
       <span>На язык</span>
-      <select
-        class="mini-select"
+      <DreamSelect
         value={targetLang}
-        onchange={(e) => onTargetChange((e.currentTarget as HTMLSelectElement).value)}
+        options={LANG_TARGET.map((language) => ({ value: language.code, label: language.label }))}
+        ariaLabel="Язык перевода"
+        onChange={onTargetChange}
         disabled={busy}
-      >
-        {#each LANG_TARGET as L (L.code)}
-          <option value={L.code}>{L.label}</option>
-        {/each}
-      </select>
-    </label>
+        compact
+      />
+    </div>
 
     <button type="button" class="run-btn" onclick={onRunTranslate} disabled={busy}>
       {busy ? "Перевожу…" : format === "pdf" ? "Перевести страницу" : "Перевести книгу"}
@@ -118,10 +115,6 @@
     gap: 0.35rem;
   }
 
-  .trans-bar.compact .mini-select {
-    max-width: 100%;
-  }
-
   .trans-bar {
     flex-shrink: 0;
     padding: 0.45rem clamp(0.65rem, 2vw, 1rem);
@@ -158,27 +151,6 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     margin-bottom: 0.35rem;
-  }
-
-  .mini-select {
-    padding: 0.32rem 1.75rem 0.32rem 0.45rem;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border-soft);
-    background-color: var(--elevated-soft);
-    color: var(--text-soft);
-    font-size: 0.82rem;
-    font-weight: 550;
-    min-width: 8.5rem;
-    cursor: pointer;
-    appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238a817a' d='M1 1.5L6 6l5-4.5'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 0.45rem center;
-  }
-
-  .mini-select option {
-    background: var(--panel-elevated);
-    color: var(--text-soft);
   }
 
   .run-btn {

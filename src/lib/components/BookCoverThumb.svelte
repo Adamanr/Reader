@@ -22,30 +22,42 @@
   let tried = $state(false);
 
   $effect(() => {
-    if (cachedUrl) {
+    if (cachedUrl && visible) {
       src = cachedUrl;
-      tried = true;
     }
   });
 
   onMount(() => {
-    if (cachedUrl || !format || format === "epub" || !isTauriRuntime()) {
+    if (!cachedUrl && (!format || format === "epub" || format === "typst" || !isTauriRuntime())) {
       tried = true;
       return;
     }
     const el = root;
     if (!el) return;
+    let idleHandle: number | null = null;
+    let frameHandle: number | null = null;
+    const reveal = () => {
+      visible = true;
+    };
     const io = new IntersectionObserver(
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) {
-          visible = true;
+          if ("requestIdleCallback" in window) {
+            idleHandle = window.requestIdleCallback(reveal, { timeout: 220 });
+          } else {
+            frameHandle = requestAnimationFrame(reveal);
+          }
           io.disconnect();
         }
       },
-      { root: null, rootMargin: "160px 0px", threshold: 0.01 },
+      { root: null, rootMargin: "100px 0px", threshold: 0.01 },
     );
     io.observe(el);
-    return () => io.disconnect();
+    return () => {
+      io.disconnect();
+      if (idleHandle != null && "cancelIdleCallback" in window) window.cancelIdleCallback(idleHandle);
+      if (frameHandle != null) cancelAnimationFrame(frameHandle);
+    };
   });
 
   $effect(() => {
@@ -84,6 +96,7 @@
 </div>
 
 <style>
+  /* Локальные стили миниатюры: блок намеренно остаётся обычным CSS для стабильного HMR. */
   .thumb-root {
     width: 100%;
     height: 100%;

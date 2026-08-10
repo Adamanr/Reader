@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import type { EpubReaderApi, QuoteDraftOptions } from "$lib/types";
   import { writeTextToClipboard } from "$lib/clipboardWrite";
   import ReaderSelectionToolbar from "$lib/components/ReaderSelectionToolbar.svelte";
@@ -7,6 +6,7 @@
   import QuoteDialog from "$lib/components/QuoteDialog.svelte";
   import { extractTextNodesHtml } from "$lib/translate/htmlText";
   import { translateStringList } from "$lib/translate/translateApi";
+  import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
 
   interface Props {
     relativePath: string;
@@ -72,11 +72,10 @@
 
   const interactionsEnabled = $derived(!!(onAddComment && onAddQuote));
 
-  function flattenToc(items: any[], depth = 0): { label: string; href: string }[] {
-    const r: { label: string; href: string }[] = [];
+  function flattenToc(items: any[], depth = 0): { label: string; href: string; level: number }[] {
+    const r: { label: string; href: string; level: number }[] = [];
     for (const it of items || []) {
-      const pad = "\u2003".repeat(depth);
-      r.push({ label: pad + (it.label || "Без названия"), href: it.href });
+      r.push({ label: it.label || "Без названия", href: it.href, level: depth });
       if (it.subitems?.length) r.push(...flattenToc(it.subitems, depth + 1));
     }
     return r;
@@ -194,11 +193,8 @@
     rendition = null;
     book = null;
     try {
-      const b64 = await invoke<string>("read_book_base64", { relativePath: path });
+      const bytes = await readLibraryBookBytes(path);
       if (sid !== session) return;
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       const ePub = (await import("epubjs")).default;
       book = ePub(bytes.buffer);
       await book.ready;
@@ -240,7 +236,7 @@
         }
       });
 
-      let toc: { label: string; href: string }[] = [];
+      let toc: { label: string; href: string; level: number }[] = [];
       try {
         await book.loaded.navigation;
         toc = flattenToc(book.navigation?.toc || []);
@@ -360,7 +356,7 @@
   }
 
   function saveQuote(opts: QuoteDraftOptions) {
-    onAddQuote?.({ text: selectedText.trim(), options: opts });
+    onAddQuote?.({ text: opts.text, options: opts });
     try {
       host?.querySelector("iframe")?.contentWindow?.getSelection()?.removeAllRanges();
     } catch {
@@ -485,5 +481,25 @@
     background: var(--elevated-soft);
     color: var(--text);
     cursor: pointer;
+  }
+
+  @media (max-width: 600px) {
+    .stage {
+      padding: 0.35rem 0.25rem max(0.35rem, env(safe-area-inset-bottom));
+    }
+
+    .stage :global(iframe) {
+      border-radius: 0 !important;
+      box-shadow: none !important;
+    }
+
+    .toolbar {
+      padding-bottom: max(0.55rem, env(safe-area-inset-bottom));
+    }
+
+    .toolbar button {
+      min-height: 2.75rem;
+      flex: 1;
+    }
   }
 </style>

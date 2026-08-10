@@ -169,4 +169,43 @@
     border-color: color-mix(in srgb, var(--accent, #c9a574) 45%, var(--border-soft, #e8dfd6));
     font-weight: 600;
   }
+
+  @media (max-width: 600px) {
+    .backdrop {
+      align-items: flex-end;
+      padding: 0;
+    }
+
+    .dlg {
+      width: 100%;
+      max-height: 92dvh;
+      overflow-y: auto;
+      padding:
+        0
+        max(1rem, env(safe-area-inset-right))
+        max(1rem, env(safe-area-inset-bottom))
+        max(1rem, env(safe-area-inset-left));
+      border-right: 0;
+      border-bottom: 0;
+      border-left: 0;
+      border-radius: 1.4rem 1.4rem 0 0;
+    }
+
+    .x,
+    .btn {
+      min-height: 2.75rem;
+    }
+
+    .x {
+      width: 2.75rem;
+    }
+
+    .lab textarea {
+      min-height: 8rem;
+    }
+
+    .ft .btn {
+      flex: 1;
+    }
+  }
 </style>

@@ -562,4 +562,43 @@
     clip: rect(0, 0, 0, 0);
     border: 0;
   }
+
+  @media (max-width: 600px) {
+    .typst-root {
+      padding:
+        0.4rem
+        max(0.35rem, env(safe-area-inset-right))
+        max(0.55rem, env(safe-area-inset-bottom))
+        max(0.35rem, env(safe-area-inset-left));
+    }
+
+    .typst-tabs {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding-bottom: 0.2rem;
+      overscroll-behavior-x: contain;
+    }
+
+    .tt,
+    .tb,
+    .save,
+    .typst-read-all {
+      min-height: 2.75rem;
+      flex-shrink: 0;
+    }
+
+    .typst-ver {
+      display: none;
+    }
+
+    .svg-host,
+    .typst-fallback {
+      padding: 0.5rem;
+    }
+
+    .typst-editor {
+      min-height: 55dvh;
+      border-radius: 0.5rem;
+    }
+  }
 </style>

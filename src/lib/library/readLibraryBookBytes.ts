@@ -1,6 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
 
 const PDF_SIG = [0x25, 0x50, 0x44, 0x46] as const; // %PDF
+const BASE64_CHUNK_SIZE = 1024 * 1024;
+
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Декодирует большие файлы порциями, не блокируя WebView на десятки кадров. */
+async function decodeBase64InChunks(base64: string): Promise<Uint8Array> {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  const outputLength = Math.floor((base64.length * 3) / 4) - padding;
+  const bytes = new Uint8Array(outputLength);
+  let offset = 0;
+
+  for (let start = 0; start < base64.length; start += BASE64_CHUNK_SIZE) {
+    const binary = atob(base64.slice(start, start + BASE64_CHUNK_SIZE));
+    for (let index = 0; index < binary.length; index++) {
+      bytes[offset++] = binary.charCodeAt(index) & 0xff;
+    }
+    if (start + BASE64_CHUNK_SIZE < base64.length) await yieldToUi();
+  }
+
+  return bytes;
+}
 
 function hasPdfSignatureInPrefix(bytes: Uint8Array, maxScan: number): boolean {
   const n = Math.min(bytes.length, maxScan);
@@ -33,9 +56,5 @@ export function assertBufferLooksLikePdf(bytes: Uint8Array, context = ""): void 
 /** Сырые байты файла книги из папки библиотеки (Tauri). */
 export async function readLibraryBookBytes(relativePath: string): Promise<Uint8Array> {
   const b64 = await invoke<string>("read_book_base64", { relativePath });
-  const bin = atob(b64);
-  const len = bin.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
-  return bytes;
+  return decodeBase64InChunks(b64);
 }

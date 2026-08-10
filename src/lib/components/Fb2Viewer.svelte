@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import type { EpubReaderApi, QuoteDraftOptions } from "$lib/types";
   import { parseFb2, type Fb2Section } from "$lib/fb2/parseFb2";
   import { writeTextToClipboard } from "$lib/clipboardWrite";
@@ -8,6 +7,7 @@
   import QuoteDialog from "$lib/components/QuoteDialog.svelte";
   import { extractTextNodesHtml } from "$lib/translate/htmlText";
   import { translateStringList } from "$lib/translate/translateApi";
+  import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
 
   interface Props {
     relativePath: string;
@@ -58,6 +58,7 @@
   let processedTranslateKey = $state(0);
   let relocatedLabel = $state("");
   let activeIdx = $state(0);
+  let lastReportedLocation = "";
 
   let toolbarVisible = $state(false);
   let toolbarX = $state(0);
@@ -74,6 +75,7 @@
     const nav = list.map((s) => ({
       label: s.title || "…",
       href: `#${s.anchor}`,
+      level: s.level,
     }));
     return {
       toc: nav,
@@ -100,13 +102,11 @@
     err = null;
     sections = [];
     relocatedLabel = "";
+    lastReportedLocation = "";
     onReaderApi?.(null);
     try {
-      const b64 = await invoke<string>("read_book_base64", { relativePath: path });
+      const bytes = await readLibraryBookBytes(path);
       if (sid !== session) return;
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       const xml = new TextDecoder("utf-8").decode(bytes);
       const parsed = parseFb2(xml);
       if (sid !== session) return;
@@ -191,7 +191,8 @@
           activeIdx = ix;
           relocatedLabel = secs[ix].title;
           const s = secs[ix];
-          onReadingProgress?.({ location: `#${s.anchor}`, label: s.title });
+          lastReportedLocation = `#${s.anchor}`;
+          onReadingProgress?.({ location: lastReportedLocation, label: s.title });
         }
       },
       { root, rootMargin: "-12% 0px -60% 0px", threshold: [0, 0.1, 0.25] },
@@ -214,7 +215,9 @@
   $effect(() => {
     const loc = initialLocation?.trim() ?? "";
     const secs = sections;
-    if (!loc || secs.length === 0) return;
+    // Сохранённый прогресс возвращается сюда через props. Не прокручиваем к
+    // началу секции повторно после обычного движения колёсиком.
+    if (!loc || loc === lastReportedLocation || secs.length === 0) return;
     const id = loc.replace(/^#/, "");
     const t = window.setTimeout(() => {
       document.getElementById(id)?.scrollIntoView({ block: "start" });
@@ -292,7 +295,7 @@
   }
 
   function saveQuote(opts: QuoteDraftOptions) {
-    onAddQuote?.({ text: selectedText.trim(), options: opts });
+    onAddQuote?.({ text: opts.text, options: opts });
     document.getSelection()?.removeAllRanges();
   }
 
@@ -487,6 +490,7 @@
     line-height: 1.65;
     color: var(--text-soft);
     font-family: Literata, Georgia, serif;
+    overflow-wrap: break-word;
   }
 
   .fb2-html :global(.fb2-p) {
@@ -601,5 +605,38 @@
     text-align: center;
     font-size: 0.88rem;
     line-height: 1.45;
+  }
+
+  @media (max-width: 600px) {
+    .fb2-scroll {
+      padding:
+        1rem
+        max(0.9rem, env(safe-area-inset-right))
+        max(1.5rem, env(safe-area-inset-bottom))
+        max(0.9rem, env(safe-area-inset-left));
+      overscroll-behavior: contain;
+      scroll-padding-top: 1rem;
+    }
+
+    .fb2-section {
+      margin-bottom: 1.35rem;
+    }
+
+    .fb2-sec-title {
+      font-size: 1.12rem;
+      line-height: 1.3;
+    }
+
+    .fb2-html {
+      font-size: 1.04rem;
+      line-height: 1.7;
+    }
+
+    .fb2-html :global(.fb2-table) {
+      display: block;
+      max-width: 100%;
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+    }
   }
 </style>

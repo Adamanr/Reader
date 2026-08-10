@@ -62,6 +62,8 @@ pub struct SavedQuote {
 #[serde(rename_all = "camelCase")]
 pub struct BookMeta {
     pub path: String,
+    #[serde(default)]
+    pub hidden: bool,
     pub shelf_id: String,
     #[serde(default)]
     pub shelf_ids: Vec<String>,
@@ -94,7 +96,6 @@ pub struct BookMeta {
     pub typst_style_relative_path: Option<String>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryMetadata {
@@ -116,6 +117,7 @@ pub struct AppConfig {
 pub struct LibrarySnapshot {
     pub library_root: Option<String>,
     pub book_paths: Vec<String>,
+    pub hidden_book_paths: Vec<String>,
     pub metadata: LibraryMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_typst_style_relative_path: Option<String>,
@@ -232,12 +234,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let parent = path.parent().ok_or_else(|| "Некорректный путь".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Некорректный путь".to_string())?;
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "Некорректное имя файла".to_string())?;
-    let tmp = parent.join(format!(".{name}.part.{}" , std::process::id()));
+    let tmp = parent.join(format!(".{name}.part.{}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     #[cfg(windows)]
     if path.exists() {
@@ -276,39 +280,47 @@ fn scan_library(root: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn merge_scan_into_metadata(paths: &[String], meta: &mut LibraryMetadata) {
+fn merge_scan_into_metadata(paths: &[String], meta: &mut LibraryMetadata) -> bool {
+    let mut changed = false;
     for p in paths {
-        meta.books.entry(p.clone()).or_insert_with(|| BookMeta {
-            path: p.clone(),
-            shelf_id: "default".into(),
-            shelf_ids: vec![],
-            importance: "normal".into(),
-            review: String::new(),
-            title: None,
-            author: None,
-            comments: vec![],
-            quotes: vec![],
-            last_read_pdf_page: None,
-            last_read_pdf_total: None,
-            last_read_location: None,
-            last_read_location_label: None,
-            translation_exported: false,
-            cover_thumb_data_url: None,
-            last_opened_at: None,
-            typst_style_relative_path: None,
-        });
+        if !meta.books.contains_key(p) {
+            meta.books.insert(
+                p.clone(),
+                BookMeta {
+                    path: p.clone(),
+                    hidden: false,
+                    shelf_id: "default".into(),
+                    shelf_ids: vec![],
+                    importance: "normal".into(),
+                    review: String::new(),
+                    title: None,
+                    author: None,
+                    comments: vec![],
+                    quotes: vec![],
+                    last_read_pdf_page: None,
+                    last_read_pdf_total: None,
+                    last_read_location: None,
+                    last_read_location_label: None,
+                    translation_exported: false,
+                    cover_thumb_data_url: None,
+                    last_opened_at: None,
+                    typst_style_relative_path: None,
+                },
+            );
+            changed = true;
+        }
     }
     let set: HashSet<_> = paths.iter().cloned().collect();
+    let previous_len = meta.books.len();
     meta.books.retain(|k, _| set.contains(k));
+    changed || meta.books.len() != previous_len
 }
 
 #[tauri::command]
 fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
     let config = load_config(&app)?;
     let root_str = config.library_root.clone();
-    let scan_result = root_str
-        .as_ref()
-        .map(|r| scan_library(Path::new(r)));
+    let scan_result = root_str.as_ref().map(|r| scan_library(Path::new(r)));
     let paths = match scan_result {
         None => vec![],
         Some(Ok(p)) => p,
@@ -320,20 +332,26 @@ fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
             return Ok(LibrarySnapshot {
                 library_root: root_str,
                 book_paths: vec![],
+                hidden_book_paths: vec![],
                 metadata,
                 default_typst_style_relative_path,
             });
         }
     };
     let mut metadata = load_metadata(&app)?;
-    merge_scan_into_metadata(&paths, &mut metadata);
-    save_metadata(&app, &metadata)?;
+    if merge_scan_into_metadata(&paths, &mut metadata) {
+        save_metadata(&app, &metadata)?;
+    }
+    let (hidden_book_paths, book_paths): (Vec<_>, Vec<_>) = paths
+        .into_iter()
+        .partition(|path| metadata.books.get(path).is_some_and(|book| book.hidden));
     let default_typst_style_relative_path = load_config(&app)
         .ok()
         .and_then(|c| c.default_typst_style_relative_path);
     Ok(LibrarySnapshot {
         library_root: root_str,
-        book_paths: paths,
+        book_paths,
+        hidden_book_paths,
         metadata,
         default_typst_style_relative_path,
     })
@@ -354,6 +372,53 @@ fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 fn save_library_metadata(app: AppHandle, metadata: LibraryMetadata) -> Result<(), String> {
     save_metadata(&app, &metadata)
+}
+
+#[tauri::command]
+fn delete_library_book(app: AppHandle, relative_path: String) -> Result<(), String> {
+    let config = load_config(&app)?;
+    let root = config
+        .library_root
+        .as_deref()
+        .ok_or_else(|| "Папка библиотеки не выбрана.".to_string())?;
+    let root = Path::new(root)
+        .canonicalize()
+        .map_err(|_| "Папка библиотеки недоступна.".to_string())?;
+    let joined = safe_join(&root, &relative_path)?;
+    let target = joined
+        .canonicalize()
+        .map_err(|_| "Файл книги уже отсутствует.".to_string())?;
+
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err("Книга находится вне папки библиотеки.".into());
+    }
+    let supported = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "pdf" | "epub" | "fb2" | "typ"
+            )
+        });
+    if !supported {
+        return Err("Этот файл нельзя удалить из Reader.".into());
+    }
+
+    std::fs::remove_file(&target)
+        .map_err(|_| "Не удалось удалить файл. Проверьте права доступа.".to_string())?;
+
+    // Файл уже удалён: очистка связанных данных выполняется best effort и не
+    // превращает успешное удаление в ошибку из-за вторичного шага.
+    if let Ok(mut metadata) = load_metadata(&app) {
+        metadata.books.remove(&relative_path);
+        let _ = save_metadata(&app, &metadata);
+    }
+    let translation = pdf_translation_file(&app, &relative_path);
+    if translation.exists() {
+        let _ = std::fs::remove_file(translation);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,8 +476,13 @@ async fn translate_texts(
             return Err(format!("Перевод: HTTP {} — {}", status, short));
         }
 
-        let parsed: LibreTranslateOk =
-            serde_json::from_str(&raw).map_err(|e| format!("Разбор ответа ({}): {}", e, raw.chars().take(160).collect::<String>()))?;
+        let parsed: LibreTranslateOk = serde_json::from_str(&raw).map_err(|e| {
+            format!(
+                "Разбор ответа ({}): {}",
+                e,
+                raw.chars().take(160).collect::<String>()
+            )
+        })?;
         out.push(parsed.translated_text);
     }
 
@@ -489,7 +559,10 @@ fn write_file_base64(path: String, contents_base64: String) -> Result<(), String
 }
 
 #[tauri::command]
-fn pdf_translation_load(app: AppHandle, book_relative_path: String) -> Result<Option<String>, String> {
+fn pdf_translation_load(
+    app: AppHandle,
+    book_relative_path: String,
+) -> Result<Option<String>, String> {
     let p = pdf_translation_file(&app, &book_relative_path);
     if !p.exists() {
         return Ok(None);
@@ -499,7 +572,11 @@ fn pdf_translation_load(app: AppHandle, book_relative_path: String) -> Result<Op
 }
 
 #[tauri::command]
-fn pdf_translation_save(app: AppHandle, book_relative_path: String, json: String) -> Result<(), String> {
+fn pdf_translation_save(
+    app: AppHandle,
+    book_relative_path: String,
+    json: String,
+) -> Result<(), String> {
     let p = pdf_translation_file(&app, &book_relative_path);
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -528,7 +605,11 @@ fn read_library_utf8(app: AppHandle, relative_path: String) -> Result<String, St
 }
 
 #[tauri::command]
-fn write_library_utf8(app: AppHandle, relative_path: String, content: String) -> Result<(), String> {
+fn write_library_utf8(
+    app: AppHandle,
+    relative_path: String,
+    content: String,
+) -> Result<(), String> {
     let config = load_config(&app)?;
     let root = config
         .library_root
@@ -539,7 +620,11 @@ fn write_library_utf8(app: AppHandle, relative_path: String, content: String) ->
 }
 
 #[tauri::command]
-fn write_library_base64(app: AppHandle, relative_path: String, contents_base64: String) -> Result<(), String> {
+fn write_library_base64(
+    app: AppHandle,
+    relative_path: String,
+    contents_base64: String,
+) -> Result<(), String> {
     let bytes = STANDARD
         .decode(contents_base64.trim())
         .map_err(|e| e.to_string())?;
@@ -587,7 +672,10 @@ fn list_typst_theme_files(app: AppHandle) -> Result<Vec<String>, String> {
 }
 
 /// Собирает пути `reader-typst-{hash}-N.svg` в temp, отсортированные по N.
-fn typst_svg_page_files(temp_dir: &Path, hash_hex: &str) -> Result<Vec<std::path::PathBuf>, String> {
+fn typst_svg_page_files(
+    temp_dir: &Path,
+    hash_hex: &str,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let prefix = format!("reader-typst-{}-", hash_hex);
     let mut pages: Vec<(u32, std::path::PathBuf)> = Vec::new();
     let read = std::fs::read_dir(temp_dir).map_err(|e| e.to_string())?;
@@ -667,13 +755,12 @@ fn compile_typst_to_svg(
     }
     cmd.arg(file_name).arg(&pattern_for_typst);
 
-    let output = cmd.output()
-        .map_err(|e| {
-            format!(
-                "Не удалось запустить `typst` (установите Typst и добавьте в PATH): {}",
-                e
-            )
-        })?;
+    let output = cmd.output().map_err(|e| {
+        format!(
+            "Не удалось запустить `typst` (установите Typst и добавьте в PATH): {}",
+            e
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -708,7 +795,10 @@ fn compile_typst_to_svg(
 
 #[tauri::command]
 fn typst_cli_version() -> Result<Option<String>, String> {
-    let out = match std::process::Command::new("typst").arg("--version").output() {
+    let out = match std::process::Command::new("typst")
+        .arg("--version")
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return Ok(None),
     };
@@ -882,6 +972,7 @@ pub fn run() {
             get_library_snapshot,
             set_library_root,
             save_library_metadata,
+            delete_library_book,
             read_book_base64,
             save_translated_pdf_next_to_source,
             write_file_base64,

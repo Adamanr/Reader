@@ -12,6 +12,7 @@
     PdfReadyInfo,
     QuoteAccent,
     QuoteDraftOptions,
+    ReaderOutlineItem,
     SavedQuote,
   } from "$lib/types";
   import PdfViewer from "$lib/components/PdfViewer.svelte";
@@ -19,11 +20,17 @@
   import Fb2Viewer from "$lib/components/Fb2Viewer.svelte";
   import TypstViewer from "$lib/components/TypstViewer.svelte";
   import TranslationBar from "$lib/components/TranslationBar.svelte";
+  import ReaderOutlineTree from "$lib/components/ReaderOutlineTree.svelte";
   import { ACCENT_CHIP_BG } from "$lib/quoteCardStyles";
   import { getBookFormat } from "$lib/bookFormat";
   import { loadPdfBookTranslationFile } from "$lib/translate/pdfFullBookJob";
   import { exportTranslatedPdfToLibrary } from "$lib/pdf/exportTranslatedPdf";
   import { exportBookToTypst } from "$lib/typst/exportToTypst";
+  import {
+    fetchLibrarySnapshot,
+    getCachedLibrarySnapshot,
+    setCachedLibraryMetadata,
+  } from "$lib/library/librarySnapshotCache";
   import type { TypstOutlineItem } from "$lib/typst/outlineTypst";
 
   const QUOTE_ACCENTS: QuoteAccent[] = ["sand", "sage", "dustyRose", "ink"];
@@ -50,7 +57,7 @@
     }
   });
 
-  let snapshot = $state<LibrarySnapshot | null>(null);
+  let snapshot = $state<LibrarySnapshot | null>(getCachedLibrarySnapshot());
   let pdfOutline = $state<PdfOutlineItem[]>([]);
   let pdfNumPages = $state(0);
   let navApi = $state<EpubReaderApi | null>(null);
@@ -78,6 +85,7 @@
   let typstExportBanner = $state<string | null>(null);
   let typstOutline = $state<TypstOutlineItem[]>([]);
   let typstJumpLine = $state<number | null>(null);
+  let readerPanelOpen = $state(false);
 
   function handleTranslateActivity(e: { busy: boolean; error: string | null }) {
     transBusy = e.busy;
@@ -99,6 +107,83 @@
       : "",
   );
   const displayAuthor = $derived(meta?.author?.trim() ?? "");
+
+  const pdfTreeItems = $derived<ReaderOutlineItem[]>(
+    pdfOutline.map((item, index) => ({
+      id: `pdf-${index}`,
+      label: item.title,
+      level: item.level,
+      meta: item.page == null ? undefined : `стр. ${item.page}`,
+      disabled: item.page == null,
+    })),
+  );
+
+  const activePdfOutlineIndex = $derived.by(() => {
+    let found = -1;
+    let foundPage = -1;
+    for (let index = 0; index < pdfOutline.length; index++) {
+      const page = pdfOutline[index]?.page;
+      if (page != null && page <= pdfPage && page > foundPage) {
+        found = index;
+        foundPage = page;
+      }
+    }
+    return found;
+  });
+
+  const activePdfTreeId = $derived(activePdfOutlineIndex >= 0 ? `pdf-${activePdfOutlineIndex}` : null);
+  const activePdfChapterLabel = $derived(
+    activePdfOutlineIndex >= 0 ? (pdfOutline[activePdfOutlineIndex]?.title ?? "") : "",
+  );
+
+  const typstTreeItems = $derived<ReaderOutlineItem[]>(
+    typstOutline.map((item, index) => ({
+      id: `typst-${index}`,
+      label: item.title,
+      level: item.level,
+      meta: `строка ${item.line}`,
+    })),
+  );
+
+  const navTreeItems = $derived<ReaderOutlineItem[]>(
+    (navApi?.toc ?? []).map((item, index) => ({
+      id: `nav-${index}`,
+      label: item.label,
+      level: item.level ?? 0,
+    })),
+  );
+
+  const activeNavTreeId = $derived.by(() => {
+    const location = meta?.lastReadLocation?.trim();
+    if (!location || !navApi) return null;
+    const locationBase = location.split("#")[0];
+    const index = navApi.toc.findIndex(
+      (item) => item.href === location || item.href.split("#")[0] === locationBase,
+    );
+    return index >= 0 ? `nav-${index}` : null;
+  });
+
+  function finishChapterNavigation() {
+    if (window.matchMedia("(max-width: 900px)").matches) readerPanelOpen = false;
+  }
+
+  function selectPdfChapter(id: string) {
+    const item = pdfOutline[Number(id.replace("pdf-", ""))];
+    if (item?.page != null) pdfPage = item.page;
+    finishChapterNavigation();
+  }
+
+  function selectTypstChapter(id: string) {
+    const item = typstOutline[Number(id.replace("typst-", ""))];
+    if (item) typstJumpLine = item.line;
+    finishChapterNavigation();
+  }
+
+  function selectNavChapter(id: string) {
+    const item = navApi?.toc[Number(id.replace("nav-", ""))];
+    if (item) void navApi?.goTo(item.href);
+    finishChapterNavigation();
+  }
 
   const storageFootnote = $derived.by(() => {
     const root = snapshot?.libraryRoot?.trim();
@@ -151,7 +236,7 @@
 
   async function loadSnapshot() {
     try {
-      snapshot = await invoke<LibrarySnapshot>("get_library_snapshot");
+      snapshot = await fetchLibrarySnapshot();
     } catch {
       snapshot = null;
     }
@@ -159,6 +244,7 @@
 
   async function persist(next: LibraryMetadata) {
     await invoke("save_library_metadata", { metadata: next });
+    setCachedLibraryMetadata(next);
     if (snapshot) snapshot = { ...snapshot, metadata: next };
   }
 
@@ -304,7 +390,8 @@
 
 
   $effect(() => {
-    void loadSnapshot();
+    const path = bookPath;
+    if (!snapshot || (path && !snapshot.metadata.books[path])) void loadSnapshot();
   });
 
   $effect(() => {
@@ -378,6 +465,15 @@
           <p class="typst-export-banner" role="status">{typstExportBanner}</p>
         {/if}
       </div>
+      <button
+        type="button"
+        class="reader-panel-toggle"
+        aria-expanded={readerPanelOpen}
+        onclick={() => (readerPanelOpen = !readerPanelOpen)}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h10" /></svg>
+        <span>Навигация</span>
+      </button>
       {#if fmt === "pdf" || fmt === "epub" || fmt === "fb2"}
         <button
           type="button"
@@ -398,7 +494,11 @@
     </header>
 
     <div class="read-body">
-      <aside class="tabs-panel">
+      <aside class="tabs-panel" class:tabs-panel-open={readerPanelOpen}>
+        <div class="panel-head-mobile">
+          <span>Навигация по книге</span>
+          <button type="button" aria-label="Закрыть навигацию" onclick={() => (readerPanelOpen = false)}>×</button>
+        </div>
         <div class="tab-row">
           <button
             type="button"
@@ -429,21 +529,11 @@
                 {#if pdfOutline.length === 0}
                   <p class="empty-hint">Оглавление не найдено или недоступно.</p>
                 {:else}
-                  {#each pdfOutline as item (item.title + (item.page ?? ""))}
-                    <button
-                      type="button"
-                      class="list-btn"
-                      disabled={item.page == null}
-                      onclick={() => {
-                        if (item.page != null) pdfPage = item.page;
-                      }}
-                    >
-                      {item.title}
-                      {#if item.page != null}
-                        <span class="meta">стр. {item.page}</span>
-                      {/if}
-                    </button>
-                  {/each}
+                  <ReaderOutlineTree
+                    items={pdfTreeItems}
+                    activeId={activePdfTreeId}
+                    onSelect={selectPdfChapter}
+                  />
                 {/if}
               {:else if fmt === "typst"}
                 {#if typstOutline.length === 0}
@@ -452,30 +542,17 @@
                     после загрузки <strong>book.typ</strong>.
                   </p>
                 {:else}
-                  {#each typstOutline as row (`${row.line}-${row.title}`)}
-                    <button
-                      type="button"
-                      class="list-btn typst-outline-btn"
-                      style:padding-left={`${0.35 + Math.min(row.level - 1, 5) * 0.72}rem`}
-                      onclick={() => (typstJumpLine = row.line)}
-                    >
-                      {row.title}
-                    </button>
-                  {/each}
+                  <ReaderOutlineTree items={typstTreeItems} onSelect={selectTypstChapter} />
                 {/if}
               {:else if navApi}
                 {#if navApi.toc.length === 0}
                   <p class="empty-hint">Оглавление пустое.</p>
                 {:else}
-                  {#each navApi.toc as row (row.href + row.label)}
-                    <button
-                      type="button"
-                      class="list-btn"
-                      onclick={() => void navApi?.goTo(row.href)}
-                    >
-                      {row.label}
-                    </button>
-                  {/each}
+                  <ReaderOutlineTree
+                    items={navTreeItems}
+                    activeId={activeNavTreeId}
+                    onSelect={selectNavChapter}
+                  />
                 {/if}
               {:else}
                 <p class="empty-hint">Загрузка…</p>
@@ -657,6 +734,14 @@
         </div>
       </aside>
 
+      <button
+        type="button"
+        class="reader-backdrop"
+        class:reader-backdrop-open={readerPanelOpen}
+        aria-label="Закрыть навигацию"
+        onclick={() => (readerPanelOpen = false)}
+      ></button>
+
       <section class="read-stage">
         <div class="stage-frame">
           {#if fmt === "pdf"}
@@ -668,6 +753,7 @@
               onPdfReady={onPdfReady}
               displayTitle={displayTitle}
               displayAuthor={displayAuthor}
+              chapterLabel={activePdfChapterLabel}
               onAddComment={addComment}
               onAddQuote={addQuote}
               pdfTranslationPanel={transLayout === "trans"}
@@ -734,7 +820,11 @@
     height: 100vh;
     height: 100dvh;
     min-height: 0;
-    background: var(--reader-bg);
+    position: relative;
+    isolation: isolate;
+    background:
+      radial-gradient(circle at 95% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 28rem),
+      var(--reader-bg);
   }
 
   .translate-tab {
@@ -792,9 +882,12 @@
     display: flex;
     align-items: center;
     gap: 0.65rem 1rem;
-    padding: 0.55rem clamp(0.65rem, 3vw, 1.15rem);
-    border-bottom: 1px solid var(--border-soft);
-    background: var(--elevated-soft);
+    min-height: 4.2rem;
+    padding: 0.6rem clamp(0.75rem, 3vw, 1.3rem);
+    border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 82%, transparent);
+    background: color-mix(in srgb, var(--panel-veil) 96%, transparent);
+    backdrop-filter: blur(16px) saturate(1.15);
+    box-shadow: 0 1px 0 color-mix(in srgb, var(--elevated-soft) 65%, transparent);
     flex-shrink: 0;
     flex-wrap: wrap;
     row-gap: 0.45rem;
@@ -813,7 +906,7 @@
     color: var(--muted);
     text-decoration: none;
     font-weight: 550;
-    padding: 0.35rem 0.5rem;
+    padding: 0.45rem 0.65rem;
     border-radius: var(--radius-sm);
     font-family: system-ui, sans-serif;
   }
@@ -830,7 +923,8 @@
     border: none;
     background: transparent;
     color: var(--accent-2);
-    padding: 0.35rem 0.5rem;
+    min-height: 2.35rem;
+    padding: 0.45rem 0.65rem;
     margin-left: -0.35rem;
     border-radius: var(--radius-sm);
     cursor: pointer;
@@ -855,13 +949,14 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
+    gap: 0.12rem;
+    padding-left: clamp(0rem, 1vw, 0.65rem);
   }
 
   .read-title {
     margin: 0;
     font-size: clamp(1rem, 3.5vw, 1.18rem);
-    font-weight: 600;
+    font-weight: 750;
     letter-spacing: -0.02em;
     color: var(--text-soft);
     line-height: 1.25;
@@ -895,8 +990,9 @@
   .typst-export-top {
     flex-shrink: 0;
     align-self: center;
-    padding: 0.4rem 0.85rem;
-    border-radius: var(--radius-sm);
+    min-height: 2.35rem;
+    padding: 0.45rem 0.9rem;
+    border-radius: 999px;
     border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-soft));
     background: color-mix(in srgb, var(--accent) 10%, var(--elevated-soft));
     color: var(--text-soft);
@@ -920,6 +1016,36 @@
     display: flex;
     gap: 0.35rem;
     flex-shrink: 0;
+  }
+
+  .reader-panel-toggle {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 2.35rem;
+    padding: 0.45rem 0.75rem;
+    border: 1px solid var(--border-soft);
+    border-radius: 999px;
+    background: var(--elevated-soft);
+    color: var(--text-soft);
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 650;
+  }
+
+  .reader-panel-toggle svg {
+    width: 1rem;
+    height: 1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+  }
+
+  .panel-head-mobile,
+  .reader-backdrop {
+    display: none;
   }
 
   .mini {
@@ -950,22 +1076,24 @@
     display: flex;
     flex-direction: column;
     border-right: 1px solid var(--border-soft);
-    background: color-mix(in srgb, var(--elevated-soft) 55%, var(--panel-soft));
+    background: color-mix(in srgb, var(--elevated-soft) 66%, var(--panel-soft));
     min-height: 0;
+    box-shadow: 7px 0 28px color-mix(in srgb, var(--text-soft) 4%, transparent);
+    z-index: 2;
   }
 
   .tab-row {
     display: flex;
     flex-shrink: 0;
     gap: 0;
-    padding: 0 0.5rem;
+    padding: 0.45rem 0.5rem 0;
     border-bottom: 1px solid var(--border-soft);
     background: var(--elevated-soft);
   }
 
   .tab {
     flex: 1;
-    padding: 0.62rem 0.35rem;
+    padding: 0.6rem 0.32rem 0.68rem;
     font-size: 0.76rem;
     border: none;
     border-bottom: 2px solid transparent;
@@ -987,6 +1115,7 @@
     color: var(--accent-2);
     border-bottom-color: color-mix(in srgb, var(--accent) 65%, var(--accent-2));
     font-weight: 650;
+    background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--accent) 7%, transparent));
   }
 
   .tab-body {
@@ -1018,7 +1147,7 @@
     gap: 0.55rem;
     width: 100%;
     text-align: left;
-    padding: 0.5rem 0.55rem;
+    padding: 0.62rem 0.65rem;
     margin-bottom: 0.35rem;
     border-radius: var(--radius-md);
     border: 1px solid transparent;
@@ -1038,14 +1167,6 @@
   .list-btn:disabled {
     opacity: 0.45;
     cursor: default;
-  }
-
-  .list-btn .meta {
-    flex-shrink: 0;
-    font-size: 0.7rem;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    padding-top: 0.12rem;
   }
 
   .page-grid {
@@ -1331,8 +1452,8 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    padding: 0.85rem 1rem 1rem 0.85rem;
-    background: var(--reader-bg);
+    padding: clamp(0.65rem, 1.8vw, 1.15rem);
+    background: transparent;
   }
 
   .stage-frame {
@@ -1340,22 +1461,173 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-xl);
     border: 1px solid color-mix(in srgb, var(--border-soft) 88%, #c9bfb4);
     background: var(--elevated-soft);
     box-shadow: var(--shadow-book);
     overflow: hidden;
   }
 
+  /* Dreamcore reader chrome: the book remains the visual focus. */
+  .read-shell {
+    background:
+      radial-gradient(circle at 92% 7%, color-mix(in srgb, #fff2bf 45%, transparent) 0 3.4rem, transparent 3.55rem),
+      radial-gradient(ellipse 30rem 18rem at 2% 0%, color-mix(in srgb, var(--accent) 21%, transparent), transparent 68%),
+      radial-gradient(ellipse 28rem 18rem at 100% 100%, color-mix(in srgb, #b8d7ef 16%, transparent), transparent 70%),
+      var(--reader-bg);
+  }
+
+  .read-top {
+    min-height: 4.6rem;
+    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
+    background: color-mix(in srgb, var(--panel-veil) 80%, transparent);
+    backdrop-filter: blur(24px) saturate(1.18);
+    box-shadow: none;
+  }
+
+  .back,
+  .settings-link,
+  .typst-export-top,
+  .reader-panel-toggle,
+  .mini {
+    border-radius: 999px;
+  }
+
+  .back {
+    margin-left: 0;
+    border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border-soft));
+    background: color-mix(in srgb, var(--elevated-soft) 54%, transparent);
+  }
+
+  .read-title {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: clamp(1.08rem, 3.5vw, 1.35rem);
+    font-weight: 500;
+    letter-spacing: -0.035em;
+  }
+
+  .tabs-panel {
+    border-color: color-mix(in srgb, var(--accent) 16%, var(--border-soft));
+    background: color-mix(in srgb, var(--panel-elevated) 68%, transparent);
+    box-shadow: 10px 0 45px color-mix(in srgb, var(--accent-2) 6%, transparent);
+    backdrop-filter: blur(20px);
+  }
+
+  .tab-row {
+    gap: 0.25rem;
+    padding: 0.55rem;
+    border-color: color-mix(in srgb, var(--accent) 14%, var(--border-soft));
+    background: transparent;
+  }
+
+  .tab {
+    margin: 0;
+    padding: 0.58rem 0.25rem;
+    border: 0;
+    border-radius: 0.75rem;
+  }
+
+  .tab.active {
+    border: 0;
+    background: color-mix(in srgb, var(--accent) 15%, var(--elevated-soft));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 15%, transparent);
+  }
+
+  .tab-body {
+    background: transparent;
+  }
+
+  .list-btn,
+  .cmt-item,
+  .quote-card {
+    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
+    background: color-mix(in srgb, var(--elevated-soft) 58%, transparent);
+  }
+
+  .notes-label textarea {
+    border-color: color-mix(in srgb, var(--accent) 18%, var(--border-soft));
+    border-radius: 1rem;
+    background: color-mix(in srgb, var(--elevated-soft) 72%, transparent);
+  }
+
+  .stage-frame {
+    border-color: color-mix(in srgb, var(--accent) 18%, var(--border-soft));
+    border-radius: 1.75rem;
+    box-shadow: 0 24px 72px color-mix(in srgb, var(--accent-2) 10%, transparent);
+  }
+
   @media (max-width: 900px) {
     .read-body {
       grid-template-columns: 1fr;
-      grid-template-rows: minmax(160px, min(38vh, 280px)) 1fr;
+      grid-template-rows: minmax(0, 1fr);
     }
 
     .tabs-panel {
-      border-right: none;
-      border-bottom: 1px solid var(--border-soft);
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 70;
+      width: min(90vw, 22rem);
+      border-right: 1px solid var(--border-soft);
+      border-bottom: none;
+      box-shadow: var(--shadow-float);
+      transform: translateX(-104%);
+      visibility: hidden;
+      transition: transform 0.24s cubic-bezier(0.33, 1, 0.68, 1), visibility 0.24s;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      overscroll-behavior: contain;
+    }
+
+    .tabs-panel-open {
+      transform: translateX(0);
+      visibility: visible;
+    }
+
+    .reader-panel-toggle {
+      display: inline-flex;
+    }
+
+    .panel-head-mobile {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 3.8rem;
+      padding: 0.7rem 0.85rem 0.55rem 1rem;
+      color: var(--text-soft);
+      font-size: 0.9rem;
+      font-weight: 700;
+    }
+
+    .panel-head-mobile button {
+      display: grid;
+      place-items: center;
+      width: 2.75rem;
+      height: 2.75rem;
+      padding: 0;
+      border: 0;
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 1.3rem;
+    }
+
+    .reader-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 65;
+      border: 0;
+      background: color-mix(in srgb, #111 42%, transparent);
+      backdrop-filter: blur(3px);
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.2s ease, visibility 0.2s;
+    }
+
+    .reader-backdrop-open {
+      display: block;
+      opacity: 1;
+      visibility: visible;
     }
 
     .read-stage {
@@ -1374,12 +1646,104 @@
     }
 
     .back {
-      padding: 0.4rem 0.55rem;
+      width: 2.75rem;
+      min-height: 2.75rem;
+      justify-content: center;
+      padding: 0;
+    }
+
+    .settings-link {
+      display: none;
+    }
+
+    .read-top {
+      gap: 0.45rem;
+      padding:
+        max(0.5rem, env(safe-area-inset-top))
+        max(0.55rem, env(safe-area-inset-right))
+        0.5rem
+        max(0.55rem, env(safe-area-inset-left));
+    }
+
+    .title-block {
+      order: 3;
+      flex-basis: 100%;
+      padding: 0.15rem 0 0.1rem;
+    }
+
+    .reader-panel-toggle {
+      margin-left: auto;
+      width: 2.75rem;
+      min-height: 2.75rem;
+      padding: 0;
+      border-radius: 999px;
+    }
+
+    .reader-panel-toggle span {
+      display: none;
+    }
+
+    .typst-export-top {
+      padding-inline: 0.7rem;
+      min-height: 2.75rem;
+    }
+
+    .mini {
+      width: 2.75rem;
+      height: 2.75rem;
+    }
+
+    .read-stage {
+      padding: 0;
+    }
+
+    .stage-frame {
+      border-right: 0;
+      border-bottom: 0;
+      border-left: 0;
+      border-radius: 0;
+      box-shadow: none;
     }
 
     .tab {
       padding: 0.55rem 0.25rem;
       font-size: 0.72rem;
+    }
+  }
+
+  @media (max-width: 600px) {
+    .read-body {
+      overscroll-behavior: none;
+    }
+
+    .tab,
+    .list-btn,
+    .page-cell {
+      min-height: 2.75rem;
+    }
+  }
+
+  @media (max-height: 520px) and (orientation: landscape) {
+    .read-top {
+      min-height: 0;
+      flex-wrap: nowrap;
+      padding-top: max(0.35rem, env(safe-area-inset-top));
+      padding-bottom: 0.35rem;
+    }
+
+    .title-block {
+      order: 0;
+      flex-basis: 8rem;
+      padding: 0;
+    }
+
+    .read-title {
+      -webkit-line-clamp: 1;
+      line-clamp: 1;
+    }
+
+    .read-author {
+      display: none;
     }
   }
 </style>

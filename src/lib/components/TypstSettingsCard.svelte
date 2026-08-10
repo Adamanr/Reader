@@ -3,12 +3,18 @@
   import { invoke } from "@tauri-apps/api/core";
   import { isTauriRuntime } from "$lib/isTauri";
   import { ensureBuiltinTypstThemes } from "$lib/typst/exportToTypst";
+  import DreamSelect from "$lib/components/DreamSelect.svelte";
 
   let busy = $state(false);
   let hint = $state<string | null>(null);
   let themes = $state<string[]>([]);
   let defaultStylePath = $state("");
   let typstCli = $state<string | null>(null);
+  const selectedTheme = $derived(
+    defaultStylePath.startsWith(".reader-typst-themes/")
+      ? defaultStylePath.slice(".reader-typst-themes/".length)
+      : "",
+  );
 
   async function refresh() {
     if (!isTauriRuntime()) return;
@@ -80,21 +86,20 @@
       />
     </label>
     {#if themes.length > 0}
-      <label class="field">
+      <div class="field">
         <span>Быстрый выбор из библиотеки стилей</span>
-        <select
-          class="sel"
-          onchange={(e) => {
-            const v = (e.currentTarget as HTMLSelectElement).value;
-            if (v) defaultStylePath = `.reader-typst-themes/${v}`;
+        <DreamSelect
+          value={selectedTheme}
+          options={[
+            { value: "", label: "Выберите файл…" },
+            ...themes.map((theme) => ({ value: theme, label: theme })),
+          ]}
+          ariaLabel="Стиль Typst из библиотеки"
+          onChange={(value) => {
+            if (value) defaultStylePath = `.reader-typst-themes/${value}`;
           }}
-        >
-          <option value="">— файл —</option>
-          {#each themes as t (t)}
-            <option value={t}>{t}</option>
-          {/each}
-        </select>
-      </label>
+        />
+      </div>
     {/if}
     <button type="button" class="btn-save" onclick={() => void saveDefault()} disabled={busy}>
       {busy ? "…" : "Сохранить стиль по умолчанию"}
@@ -169,8 +174,7 @@
     font-family: system-ui, sans-serif;
   }
 
-  .field input,
-  .sel {
+  .field input {
     padding: 0.45rem 0.55rem;
     border-radius: var(--radius-sm, 8px);
     border: 1px solid var(--border-soft);

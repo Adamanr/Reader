@@ -1,6 +1,5 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
   import {
     AnnotationType,
     getDocument,
@@ -20,6 +19,7 @@
     splitForTranslation,
   } from "$lib/pdf/readablePageText";
   import { translateStringList } from "$lib/translate/translateApi";
+  import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
 
   GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -125,10 +125,9 @@
   ): Promise<PdfOutlineItem[]> {
     const out: PdfOutlineItem[] = [];
     for (const node of nodes) {
-      const pad = "\u2003".repeat(depth);
-      const title = pad + (node.title?.trim() || "Без названия");
+      const title = node.title?.trim() || "Без названия";
       const page = await resolveDestToPageNumber(pdf, node.dest);
-      out.push({ title, page });
+      out.push({ title, page, level: depth });
       if (node.items?.length) {
         out.push(...(await flattenOutline(pdf, node.items, depth + 1)));
       }
@@ -145,10 +144,7 @@
     textLayerInst?.cancel();
     textLayerInst = null;
     try {
-      const b64 = await invoke<string>("read_book_base64", { relativePath });
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const bytes = await readLibraryBookBytes(relativePath);
       const loadingTask = getDocument({ data: bytes });
       const doc = await loadingTask.promise;
       pdfDoc = doc;
@@ -442,7 +438,7 @@
   }
 
   function saveQuote(opts: QuoteDraftOptions) {
-    onAddQuote?.({ text: selectedText.trim(), options: opts });
+    onAddQuote?.({ text: opts.text, options: opts });
     document.getSelection()?.removeAllRanges();
   }
 
@@ -678,6 +674,14 @@
     cursor: text;
     color: transparent;
   }
+  /* Глобальный ::selection задаёт цвет текста. Для прозрачного слоя PDF это
+     проявляло вторую копию слова поверх отрисованной страницы. */
+  .page-stack :global(.textLayer span:not(.pdf-inline-tr)::selection) {
+    color: transparent;
+  }
+  .page-stack :global(.textLayer span:not(.pdf-inline-tr)::-moz-selection) {
+    color: transparent;
+  }
   /** Полный перевод: читаемый текст поверх белой подложки (растр страницы без изменений) */
   .page-stack :global(.textLayer span.pdf-inline-tr) {
     color: #141414;
@@ -766,5 +770,39 @@
   .zoom input {
     width: 120px;
     accent-color: var(--accent);
+  }
+
+  @media (max-width: 600px) {
+    .pdf-root.reader .canvas-wrap,
+    .canvas-wrap {
+      padding: 0.45rem 0.35rem 0.6rem;
+      overscroll-behavior: contain;
+    }
+
+    .toolbar {
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      padding:
+        0.45rem
+        max(0.55rem, env(safe-area-inset-right))
+        max(0.45rem, env(safe-area-inset-bottom))
+        max(0.55rem, env(safe-area-inset-left));
+    }
+
+    .toolbar button {
+      min-width: 2.75rem;
+      min-height: 2.75rem;
+    }
+
+    .zoom {
+      flex: 1 1 10rem;
+      min-height: 2.75rem;
+    }
+
+    .zoom input {
+      flex: 1;
+      width: auto;
+      min-width: 5rem;
+    }
   }
 </style>
