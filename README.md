@@ -17,14 +17,48 @@ Reader keeps a book collection on your device and provides a focused Russian-lan
 
 ## Features
 
-- PDF, EPUB, FB2 and Typst reading with format-specific navigation and outlines.
-- Custom shelves, multiple shelves per book, sorting, importance, hidden books and cover thumbnails.
-- Saved reading progress, comments, reviews and customizable quote cards with PNG export.
-- Five built-in visual themes.
-- Page and chapter translation through a configurable LibreTranslate-compatible server.
-- Resumable full-PDF translation through local OpenAI-compatible APIs such as LM Studio or Ollama.
+**Reading**
+
+- PDF, EPUB, FB2 and Typst with outlines, full-text search and precise position restore.
+- Typography panel: bundled Literata, Lora, PT Serif and PT Sans, size, line height, line length, margins, paragraph spacing, hyphenation and presets.
+- Page themes independent of the app theme (paper, sepia, graphite, night, cover-tinted) and a "living cover" accent taken from the book cover.
+- Immersive and fullscreen modes, tap zones and swipes, keyboard shortcuts, a status line with chapter, time left and a seekable progress bar.
+- PDF: sharp HiDPI rendering, continuous scroll, single page and spread layouts, fit width/page, dark inversion and white-margin cropping.
+- Focus modes: paragraph dimming and a reading ruler.
+
+**Notes**
+
+- Colored highlights with margin notes in all formats, a notes panel per book and a cross-book notes feed.
+- Markdown export (Obsidian-friendly) and customizable quote cards with PNG export.
+- Quote constellation: your highlights laid out as stars by similarity.
+
+**Library**
+
+- "Continue reading" block, reading statuses, cover grid or spine shelf, drag-and-drop import and automatic title/author detection.
+- "Dust on the shelf": books you haven't touched for months slowly fade.
+- Reading rhythm: time per day and per book, streaks, heatmap and your personal reading pace.
+- Optional sync without a cloud: keep metadata in `<library>/.reader` and sync the folder with Syncthing or Nextcloud.
+
+**Assistant and audio (all local)**
+
+- "Previously in the book…": a spoiler-free recap up to your current position, via LM Studio or Ollama.
+- "Who is this?": explains a character or term using only the part you've already read and builds a per-book glossary.
+- Word lookup with translation and in-context meaning, plus a spaced-repetition deck of words with their original sentences.
+- Read aloud with system voices, Piper or espeak-ng; RSVP speed reading; generated ambient soundscapes.
+- Page and chapter translation through LibreTranslate and resumable full-PDF translation through local OpenAI-compatible APIs.
 - Export to Typst and export translated PDF files.
-- Local file access through the Tauri backend with path validation and atomic writes.
+
+### Keyboard shortcuts in the reader
+
+| Key | Action |
+| --- | --- |
+| ← → / PgUp PgDn / Space | Previous / next page |
+| F, F11 | Immersive mode, fullscreen |
+| T, N, / or Ctrl+F | Contents, notes, search |
+| A | Typography panel |
+| S, R | Read aloud, RSVP speed reading |
+| Ctrl + / Ctrl − | Larger / smaller text (zoom for PDF) |
+| Esc | Close popups, leave immersive mode |
 
 ## Downloads
 
@@ -41,6 +75,8 @@ Unsigned or development builds may trigger operating-system warnings. Production
 - Android Studio, Android SDK and NDK for Android builds.
 
 Translation is optional. Reader can use a LibreTranslate-compatible endpoint for interactive translation and a local OpenAI-compatible endpoint for full-PDF translation.
+
+The reading assistant is optional too: point it at LM Studio or Ollama in Settings. For read-aloud without system voices, install [Piper](https://github.com/rhasspy/piper) (with a Russian voice such as `ru_RU-irina-medium`) or `espeak-ng` and make sure it is on `PATH`.
 
 ## Development
 

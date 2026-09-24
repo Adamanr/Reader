@@ -569,7 +569,6 @@
         ...(mode === "scrolled" ? { flow: "scrolled", manager: "continuous" } : { flow: "paginated" }),
       });
       rendition.hooks.content.register(contentHook);
-      if (import.meta.env.DEV) (window as any).__rendition = rendition;
 
       try {
         await book.loaded.navigation;
