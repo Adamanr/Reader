@@ -77,6 +77,7 @@
         class="spine"
         class:reading={status === "reading"}
         class:done={status === "done"}
+        class:dusty={dustLevel(meta) > 0.02}
         style={spineStyle(p, meta)}
         title={`${bookTitle(p, meta)}${meta?.author ? " — " + meta.author : ""}${dust ? "\n" + dust : ""}`}
         onclick={() => onOpen(p)}
@@ -155,15 +156,16 @@
     box-shadow:
       inset 0 -2px 0 rgba(0, 0, 0, 0.18),
       2px 0 3px rgba(0, 0, 0, 0.12);
-    filter: grayscale(calc(var(--dust) * 0.75)) sepia(calc(var(--dust) * 0.35)) brightness(calc(1 - var(--dust) * 0.1));
     transform-origin: bottom center;
-    transition:
-      transform 0.25s cubic-bezier(0.33, 1, 0.68, 1),
-      filter 0.6s ease;
+    transition: transform 0.25s cubic-bezier(0.33, 1, 0.68, 1);
     overflow: hidden;
   }
 
-  .spine::after {
+  .spine.dusty {
+    filter: grayscale(calc(var(--dust) * 0.75)) sepia(calc(var(--dust) * 0.35)) brightness(calc(1 - var(--dust) * 0.1));
+  }
+
+  .spine.dusty::after {
     content: "";
     position: absolute;
     inset: 0;

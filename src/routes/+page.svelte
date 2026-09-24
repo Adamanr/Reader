@@ -820,8 +820,7 @@
   }
 
   .topbar.scrolled {
-    background: color-mix(in srgb, var(--bg-soft) 82%, transparent);
-    backdrop-filter: blur(14px) saturate(1.1);
+    background: color-mix(in srgb, var(--bg-soft) 96%, transparent);
     border-bottom-color: color-mix(in srgb, var(--border-soft) 60%, transparent);
   }
 
@@ -837,8 +836,7 @@
     padding: 0.62rem 0.9rem;
     border-radius: 999px;
     border: 1px solid color-mix(in srgb, var(--border-soft) 75%, transparent);
-    background: color-mix(in srgb, var(--panel-elevated) 85%, transparent);
-    backdrop-filter: blur(10px);
+    background: var(--panel-elevated);
     box-shadow: 0 1px 2px rgba(20, 14, 30, 0.04);
     transition:
       border-color 0.2s ease,
@@ -1292,9 +1290,8 @@
     height: 2rem;
     border: none;
     border-radius: 999px;
-    background: color-mix(in srgb, var(--panel-elevated) 90%, transparent);
+    background: var(--panel-elevated);
     color: var(--text-soft);
-    backdrop-filter: blur(8px);
     box-shadow: 0 4px 12px rgba(20, 14, 30, 0.18);
     cursor: pointer;
     opacity: 0;

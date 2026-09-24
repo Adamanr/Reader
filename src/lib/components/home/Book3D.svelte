@@ -23,7 +23,7 @@
   const dust = $derived(dustLevel(meta));
 </script>
 
-<div class="book" class:tilt style:--dust={dust.toFixed(2)}>
+<div class="book" class:tilt class:dusty={dust > 0.02} style:--dust={dust.toFixed(2)}>
   <div class="cover">
     <BookCoverThumb bookPath={path} format={fmt} {eager} {needMeta} {onMeta} {onCover}>
       <CoverArt
@@ -36,7 +36,7 @@
     </BookCoverThumb>
     <span class="spine" aria-hidden="true"></span>
     <span class="gloss" aria-hidden="true"></span>
-    <span class="dust" aria-hidden="true"></span>
+    {#if dust > 0.02}<span class="dust" aria-hidden="true"></span>{/if}
   </div>
   <span class="pages" aria-hidden="true"></span>
 </div>
@@ -57,8 +57,7 @@
     bottom: -7%;
     height: 12%;
     border-radius: 50%;
-    background: radial-gradient(closest-side, rgba(20, 14, 30, 0.28), transparent);
-    filter: blur(4px);
+    background: radial-gradient(closest-side, rgba(20, 14, 30, 0.24), rgba(20, 14, 30, 0.08) 60%, transparent);
     z-index: 0;
     transition:
       transform 0.35s ease,
@@ -78,8 +77,11 @@
     transform-origin: left center;
     transition:
       transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1),
-      box-shadow 0.45s ease,
-      filter 0.7s ease;
+      box-shadow 0.45s ease;
+  }
+
+  /* Фильтр — только у «пыльных» книг: на каждой обложке он дорог для WebKit. */
+  .dusty .cover {
     filter: grayscale(calc(var(--dust) * 0.8)) sepia(calc(var(--dust) * 0.3)) brightness(calc(1 - var(--dust) * 0.08));
   }
 
@@ -138,7 +140,6 @@
   :global(:hover > .book-hover-target) .book.tilt .cover,
   .book.tilt:hover .cover {
     transform: rotateY(-18deg) translateX(-2%);
-    filter: none;
     box-shadow:
       0 1px 2px rgba(20, 14, 30, 0.2),
       18px 18px 30px -12px rgba(20, 14, 30, 0.45);
@@ -147,6 +148,11 @@
   :global(:hover > .book-hover-target) .book.tilt .pages,
   .book.tilt:hover .pages {
     transform: translateX(6%);
+  }
+
+  :global(:hover > .book-hover-target) .book.tilt.dusty .cover,
+  .book.tilt.dusty:hover .cover {
+    filter: none;
   }
 
   :global(:hover > .book-hover-target) .book.tilt .dust,

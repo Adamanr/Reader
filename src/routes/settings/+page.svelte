@@ -57,8 +57,7 @@
   .settings-top {
     padding: clamp(1rem, 3vw, 1.5rem) clamp(1rem, 5vw, 2rem) clamp(1.4rem, 4vw, 2rem);
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-    background: color-mix(in srgb, var(--panel-veil) 72%, transparent);
-    backdrop-filter: blur(24px) saturate(1.15);
+    background: color-mix(in srgb, var(--panel-veil) 90%, transparent);
   }
 
   .settings-top-inner {
@@ -142,9 +141,8 @@
     padding: 1.2rem;
     border-color: color-mix(in srgb, var(--accent) 17%, var(--border-soft));
     border-radius: 1.45rem;
-    background: color-mix(in srgb, var(--panel-elevated) 74%, transparent);
+    background: color-mix(in srgb, var(--panel-elevated) 92%, transparent);
     box-shadow: 0 18px 60px color-mix(in srgb, var(--accent-2) 8%, transparent);
-    backdrop-filter: blur(20px) saturate(1.08);
   }
 
   :global(.settings-main > .card:last-child) {

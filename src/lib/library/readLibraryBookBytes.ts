@@ -55,6 +55,15 @@ export function assertBufferLooksLikePdf(bytes: Uint8Array, context = ""): void 
 
 /** Сырые байты файла книги из папки библиотеки (Tauri). */
 export async function readLibraryBookBytes(relativePath: string): Promise<Uint8Array> {
+  try {
+    // Двоичный ответ: без base64 и разбора JSON на главном потоке.
+    const buf = await invoke<ArrayBuffer | number[]>("read_book_bytes", { relativePath });
+    if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
+    if (Array.isArray(buf)) return Uint8Array.from(buf);
+  } catch (e) {
+    const msg = String(e);
+    if (!/read_book_bytes|not found|unknown command/i.test(msg)) throw e;
+  }
   const b64 = await invoke<string>("read_book_base64", { relativePath });
   return decodeBase64InChunks(b64);
 }

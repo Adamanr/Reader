@@ -313,8 +313,13 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Запись через временный файл и rename — не остаётся обрубка размером 0 при обрыве записи.
+/// Команды выполняются параллельно, поэтому записи сериализуем и даём временным файлам уникальные имена.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -325,7 +330,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "Некорректное имя файла".to_string())?;
-    let tmp = parent.join(format!(".{name}.part.{}", std::process::id()));
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.part.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     #[cfg(windows)]
     if path.exists() {
@@ -409,7 +415,7 @@ fn merge_scan_into_metadata(paths: &[String], meta: &mut LibraryMetadata) -> boo
 }
 
 #[tauri::command]
-fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
+async fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
     let config = load_config(&app)?;
     let root_str = config.library_root.clone();
     let scan_result = root_str.as_ref().map(|r| scan_library(Path::new(r)));
@@ -452,7 +458,7 @@ fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
 }
 
 #[tauri::command]
-fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
+async fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
     let p = PathBuf::from(&path);
     if !p.is_dir() {
         return Err("Укажите существующую папку".into());
@@ -464,12 +470,12 @@ fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn save_library_metadata(app: AppHandle, metadata: LibraryMetadata) -> Result<(), String> {
+async fn save_library_metadata(app: AppHandle, metadata: LibraryMetadata) -> Result<(), String> {
     save_metadata(&app, &metadata)
 }
 
 #[tauri::command]
-fn delete_library_book(app: AppHandle, relative_path: String) -> Result<(), String> {
+async fn delete_library_book(app: AppHandle, relative_path: String) -> Result<(), String> {
     let config = load_config(&app)?;
     let root = config
         .library_root
@@ -517,7 +523,7 @@ fn delete_library_book(app: AppHandle, relative_path: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn cover_get(app: AppHandle, book_relative_path: String) -> Result<Option<String>, String> {
+async fn cover_get(app: AppHandle, book_relative_path: String) -> Result<Option<String>, String> {
     let p = cover_file(&app, &book_relative_path);
     if !p.exists() {
         return Ok(None);
@@ -528,7 +534,11 @@ fn cover_get(app: AppHandle, book_relative_path: String) -> Result<Option<String
 }
 
 #[tauri::command]
-fn cover_set(app: AppHandle, book_relative_path: String, data_url: String) -> Result<(), String> {
+async fn cover_set(
+    app: AppHandle,
+    book_relative_path: String,
+    data_url: String,
+) -> Result<(), String> {
     if !data_url.starts_with("data:image/") || data_url.len() > 400_000 {
         return Err("Некорректная обложка".into());
     }
@@ -536,7 +546,7 @@ fn cover_set(app: AppHandle, book_relative_path: String, data_url: String) -> Re
 }
 
 #[tauri::command]
-fn store_read(app: AppHandle, name: String) -> Result<Option<String>, String> {
+async fn store_read(app: AppHandle, name: String) -> Result<Option<String>, String> {
     let p = store_file(&app, &name)?;
     if !p.exists() {
         return Ok(None);
@@ -547,7 +557,7 @@ fn store_read(app: AppHandle, name: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn store_write(app: AppHandle, name: String, json: String) -> Result<(), String> {
+async fn store_write(app: AppHandle, name: String, json: String) -> Result<(), String> {
     let p = store_file(&app, &name)?;
     atomic_write(&p, json.as_bytes())
 }
@@ -555,7 +565,7 @@ fn store_write(app: AppHandle, name: String, json: String) -> Result<(), String>
 /// Копирует файлы с диска (перетаскивание в окно) в корень библиотеки.
 /// Возвращает относительные пути добавленных книг.
 #[tauri::command]
-fn import_books(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
+async fn import_books(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
     let config = load_config(&app)?;
     let root = config
         .library_root
@@ -611,7 +621,7 @@ fn import_books(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, Strin
 /// При включении копирует текущие данные туда, если там ещё ничего нет;
 /// если данные уже есть (пришли с другого устройства) — использует их.
 #[tauri::command]
-fn set_sync_in_library(app: AppHandle, enabled: bool) -> Result<(), String> {
+async fn set_sync_in_library(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut c = load_config(&app)?;
     if c.sync_in_library == enabled {
         return Ok(());
@@ -733,8 +743,33 @@ async fn translate_texts(
     Ok(out)
 }
 
+/// Файл книги как двоичный ответ (ArrayBuffer в JS) — без base64 и JSON,
+/// что заметно быстрее и не нагружает интерфейс на больших PDF.
 #[tauri::command]
-fn read_book_base64(app: AppHandle, relative_path: String) -> Result<String, String> {
+async fn read_book_bytes(
+    app: AppHandle,
+    relative_path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let config = load_config(&app)?;
+    let root = config
+        .library_root
+        .ok_or("Сначала выберите папку библиотеки")?;
+    let full = safe_join(&PathBuf::from(root), &relative_path)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(&full))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Err(
+            "Файл книги пуст (0 байт). Проверьте файл в папке библиотеки или переимпортируйте книгу."
+                .into(),
+        );
+    }
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+async fn read_book_base64(app: AppHandle, relative_path: String) -> Result<String, String> {
     let config = load_config(&app)?;
     let root = config
         .library_root
@@ -753,7 +788,7 @@ fn read_book_base64(app: AppHandle, relative_path: String) -> Result<String, Str
 
 /// Сохраняет PDF перевода в той же папке, что и исходник: `translate_<имя>.pdf`, помечает оригинал.
 #[tauri::command]
-fn save_translated_pdf_next_to_source(
+async fn save_translated_pdf_next_to_source(
     app: AppHandle,
     source_relative_path: String,
     pdf_base64: String,
@@ -794,7 +829,7 @@ fn save_translated_pdf_next_to_source(
 
 /// Запись произвольного файла (путь из диалога сохранения).
 #[tauri::command]
-fn write_file_base64(path: String, contents_base64: String) -> Result<(), String> {
+async fn write_file_base64(path: String, contents_base64: String) -> Result<(), String> {
     let bytes = STANDARD
         .decode(contents_base64.trim())
         .map_err(|e| e.to_string())?;
@@ -803,7 +838,7 @@ fn write_file_base64(path: String, contents_base64: String) -> Result<(), String
 }
 
 #[tauri::command]
-fn pdf_translation_load(
+async fn pdf_translation_load(
     app: AppHandle,
     book_relative_path: String,
 ) -> Result<Option<String>, String> {
@@ -816,7 +851,7 @@ fn pdf_translation_load(
 }
 
 #[tauri::command]
-fn pdf_translation_save(
+async fn pdf_translation_save(
     app: AppHandle,
     book_relative_path: String,
     json: String,
@@ -829,7 +864,7 @@ fn pdf_translation_save(
 }
 
 #[tauri::command]
-fn pdf_translation_delete(app: AppHandle, book_relative_path: String) -> Result<(), String> {
+async fn pdf_translation_delete(app: AppHandle, book_relative_path: String) -> Result<(), String> {
     let p = pdf_translation_file(&app, &book_relative_path);
     if p.exists() {
         std::fs::remove_file(&p).map_err(|e| e.to_string())?;
@@ -838,7 +873,7 @@ fn pdf_translation_delete(app: AppHandle, book_relative_path: String) -> Result<
 }
 
 #[tauri::command]
-fn read_library_utf8(app: AppHandle, relative_path: String) -> Result<String, String> {
+async fn read_library_utf8(app: AppHandle, relative_path: String) -> Result<String, String> {
     let config = load_config(&app)?;
     let root = config
         .library_root
@@ -849,7 +884,7 @@ fn read_library_utf8(app: AppHandle, relative_path: String) -> Result<String, St
 }
 
 #[tauri::command]
-fn write_library_utf8(
+async fn write_library_utf8(
     app: AppHandle,
     relative_path: String,
     content: String,
@@ -864,7 +899,7 @@ fn write_library_utf8(
 }
 
 #[tauri::command]
-fn write_library_base64(
+async fn write_library_base64(
     app: AppHandle,
     relative_path: String,
     contents_base64: String,
@@ -882,14 +917,17 @@ fn write_library_base64(
 }
 
 #[tauri::command]
-fn set_default_typst_style(app: AppHandle, relative_path: Option<String>) -> Result<(), String> {
+async fn set_default_typst_style(
+    app: AppHandle,
+    relative_path: Option<String>,
+) -> Result<(), String> {
     let mut c = load_config(&app)?;
     c.default_typst_style_relative_path = relative_path;
     save_config(&app, &c)
 }
 
 #[tauri::command]
-fn list_typst_theme_files(app: AppHandle) -> Result<Vec<String>, String> {
+async fn list_typst_theme_files(app: AppHandle) -> Result<Vec<String>, String> {
     let config = load_config(&app)?;
     let root = config
         .library_root
@@ -958,7 +996,7 @@ fn remove_old_typst_preview_svgs(temp_dir: &Path, hash_hex: &str) {
 /// Несколько страниц: в Typst 0.14+ нужен шаблон пути с `{p}`, иначе ошибка экспорта.
 /// `pages`: например `"1-18"` для быстрого предпросмотра (`typst compile --pages …`).
 #[tauri::command]
-fn compile_typst_to_svg(
+async fn compile_typst_to_svg(
     app: AppHandle,
     main_relative: String,
     pages: Option<String>,
@@ -1038,7 +1076,7 @@ fn compile_typst_to_svg(
 }
 
 #[tauri::command]
-fn typst_cli_version() -> Result<Option<String>, String> {
+async fn typst_cli_version() -> Result<Option<String>, String> {
     let out = match std::process::Command::new("typst")
         .arg("--version")
         .output()
@@ -1262,7 +1300,7 @@ fn command_exists(name: &str) -> bool {
 
 /// Доступные локальные движки озвучки.
 #[tauri::command]
-fn tts_engines() -> Vec<String> {
+async fn tts_engines() -> Vec<String> {
     let mut out = Vec::new();
     if command_exists("piper") {
         out.push("piper".to_string());
@@ -1362,6 +1400,7 @@ pub fn run() {
             save_library_metadata,
             delete_library_book,
             read_book_base64,
+            read_book_bytes,
             save_translated_pdf_next_to_source,
             write_file_base64,
             translate_texts,

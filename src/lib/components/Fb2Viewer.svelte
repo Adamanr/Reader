@@ -258,12 +258,19 @@
     return lo;
   }
 
-  function emitPosition() {
+  let lastEmitKey = "";
+
+  function emitPosition(force = false) {
     if (blocks.length === 0) return;
     const i = firstVisibleBlock();
     currentBlock = i;
     const root = scrollRoot!;
     const atEnd = root.scrollTop + root.clientHeight >= root.scrollHeight - 4;
+    if (reading.s.focus === "paragraph") setFocusBlock(blockAtLine(0.38));
+    // Прокрутка внутри того же абзаца ничего не меняет — не будим весь интерфейс.
+    const key = `${i}|${atEnd}|${restored}`;
+    if (!force && key === lastEmitKey) return;
+    lastEmitKey = key;
     const si = blockSection[i] ?? -1;
     const sec = sections[si];
     const read = cumChars[i] ?? 0;
@@ -282,7 +289,6 @@
         progress,
       });
     }
-    if (reading.s.focus === "paragraph") setFocusBlock(blockAtLine(0.38));
   }
 
   function setFocusBlock(i: number) {
@@ -320,7 +326,7 @@
         }
         restored = true;
       }
-      emitPosition();
+      emitPosition(true);
     });
   });
 

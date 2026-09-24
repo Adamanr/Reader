@@ -161,7 +161,21 @@
   const meta = $derived(bookPath && snapshot?.metadata.books[bookPath] ? snapshot.metadata.books[bookPath] : null);
   const displayTitle = $derived(bookPath ? meta?.title?.trim() || titleFromPath(bookPath) : "");
   const displayAuthor = $derived(meta?.author?.trim() ?? "");
-  const highlights = $derived<Highlight[]>(meta?.highlights ?? []);
+  /**
+   * Список выделений меняем только когда они реально изменились: сохранение
+   * позиции пересоздаёт метаданные книги, и без этого просмотрщики
+   * перерисовывали бы все выделения на каждом шаге прокрутки.
+   */
+  const EMPTY_HIGHLIGHTS: Highlight[] = [];
+  let highlights = $state.raw<Highlight[]>(EMPTY_HIGHLIGHTS);
+  let highlightsSig = "";
+  $effect(() => {
+    const list = meta?.highlights ?? EMPTY_HIGHLIGHTS;
+    const sig = list.map((h) => `${h.id}|${h.color}|${h.note ?? ""}`).join(";");
+    if (sig === highlightsSig) return;
+    highlightsSig = sig;
+    highlights = list;
+  });
 
   // ——— Палитра страницы и «живая обложка» ———
   let themeTick = $state(0);
@@ -385,9 +399,12 @@
   }
 
   let locSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSavedLocation = "";
   function onReadingLocationSave(p: { location: string; label: string; href: string; progress: number | null }) {
     if (!bookPath) return;
     const path = bookPath;
+    // Позиция не изменилась — не пишем метаданные на диск ещё раз.
+    if (`${path}|${p.location}` === lastSavedLocation && !locSaveTimer) return;
     if (locSaveTimer) clearTimeout(locSaveTimer);
     locSaveTimer = setTimeout(() => {
       patchBook(path, {
@@ -398,8 +415,9 @@
         minutesLeft: bookMinutesLeft(),
       });
       maybeFinish(p.progress);
+      lastSavedLocation = `${path}|${p.location}`;
       locSaveTimer = null;
-    }, 600);
+    }, 1200);
   }
 
   $effect(() => {
@@ -1388,8 +1406,7 @@
     padding: env(safe-area-inset-top) 0.6rem 0;
     box-sizing: content-box;
     border-bottom: 1px solid color-mix(in srgb, var(--chrome-muted) 18%, transparent);
-    background: color-mix(in srgb, var(--page-bg) 86%, transparent);
-    backdrop-filter: blur(14px) saturate(1.1);
+    background: var(--page-bg);
     z-index: 50;
     transition:
       transform 0.28s ease,

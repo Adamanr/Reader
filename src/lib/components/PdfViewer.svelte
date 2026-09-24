@@ -316,7 +316,8 @@
     const el = scroller;
     if (!el || mode !== "continuous") return;
     const line = el.scrollTop + el.clientHeight * 0.3;
-    const rowsEls = Array.from(el.querySelectorAll<HTMLElement>("[data-row]"));
+    // Строки — прямые потомки прокрутки: живая коллекция без выборки на каждом кадре.
+    const rowsEls = el.children as HTMLCollectionOf<HTMLElement>;
     let lo = 0;
     let hi = rowsEls.length - 1;
     while (lo < hi) {
@@ -328,9 +329,17 @@
     if (n !== pageNum) {
       reportedPage = n;
       pageNum = n;
+      return; // позицию отправит эффект смены страницы
     }
-    emitPosition();
+    // Внутри страницы обновляем прогресс не чаще, чем на заметный шаг.
+    const within = Math.floor(((el.scrollTop - (rowsEls[lo]?.offsetTop ?? 0)) / Math.max(1, rowsEls[lo]?.offsetHeight ?? 1)) * 8);
+    if (within !== lastWithin) {
+      lastWithin = within;
+      emitPosition();
+    }
   }
+
+  let lastWithin = -1;
 
   let scrollRaf = 0;
   function onScroll() {
@@ -619,8 +628,21 @@
     };
   }
 
+  const NO_HIGHLIGHTS: Highlight[] = [];
+  /** Выделения по страницам: одни и те же массивы, пока выделения не менялись. */
+  const highlightsByPage = $derived.by(() => {
+    const m = new Map<number, Highlight[]>();
+    for (const h of highlights) {
+      if (h.page == null || h.offset == null) continue;
+      const list = m.get(h.page) ?? [];
+      list.push(h);
+      m.set(h.page, list);
+    }
+    return m;
+  });
+
   function highlightsFor(n: number): Highlight[] {
-    return highlights.filter((h) => h.page === n && h.offset != null);
+    return highlightsByPage.get(n) ?? NO_HIGHLIGHTS;
   }
 
   function isActive(rowIdx: number): boolean {
@@ -796,7 +818,6 @@
     background: color-mix(in srgb, var(--toolbar-surface) 92%, transparent);
     border: 1px solid var(--toolbar-border);
     box-shadow: var(--shadow-soft);
-    backdrop-filter: blur(12px);
     opacity: 0.55;
     transition: opacity 0.2s ease;
     z-index: 5;

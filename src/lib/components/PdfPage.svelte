@@ -144,7 +144,7 @@
 
   /** Плотность пикселей с ограничением размера холста (лимиты памяти/текстур). */
   function pixelRatio(viewport: PageViewport): number {
-    const want = Math.min(window.devicePixelRatio || 1, 3);
+    const want = Math.min(window.devicePixelRatio || 1, 2);
     const MAX_PIXELS = 16_000_000;
     const area = viewport.width * viewport.height;
     return Math.max(0.5, Math.min(want, Math.sqrt(MAX_PIXELS / Math.max(1, area))));

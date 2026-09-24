@@ -17,6 +17,25 @@
   let { books, total, onOpen, onTone }: Props = $props();
 
   let coverUrl = $state<string | null>(null);
+  /** Крошечная копия обложки: растянутая, она сама выглядит размытой — без дорогого CSS-blur. */
+  let backdropUrl = $state<string | null>(null);
+
+  async function tinyCopy(url: string): Promise<string | null> {
+    const img = new Image();
+    img.src = url;
+    try {
+      await img.decode();
+    } catch {
+      return null;
+    }
+    const c = document.createElement("canvas");
+    c.width = 16;
+    c.height = 24;
+    const ctx = c.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL("image/png");
+  }
   let now = $state(new Date());
 
   onMount(() => {
@@ -39,6 +58,8 @@
     void loadCover(m.path, getBookFormat(m.path)).then(async (u) => {
       if (!alive) return;
       coverUrl = u;
+      backdropUrl = u ? await tinyCopy(u) : null;
+      if (!alive) return;
       onTone?.(await coverTone(u));
     });
     return () => {
@@ -91,8 +112,8 @@
 
 {#if main}
   <section class="hero" aria-label="Продолжить чтение">
-    {#if coverUrl}
-      <div class="backdrop" style:background-image="url({coverUrl})" aria-hidden="true"></div>
+    {#if backdropUrl}
+      <div class="backdrop" style:background-image="url({backdropUrl})" aria-hidden="true"></div>
     {/if}
     <div class="veil" aria-hidden="true"></div>
     <button type="button" class="hero-book book-hover-target-parent" onclick={() => onOpen(main.path)} aria-label="Открыть «{bookTitle(main.path, main.meta)}»">
@@ -195,9 +216,7 @@
     z-index: -2;
     background-size: cover;
     background-position: center;
-    filter: blur(48px) saturate(1.3);
-    opacity: 0.55;
-    transform: scale(1.1);
+    opacity: 0.6;
   }
 
   .veil {
