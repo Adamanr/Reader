@@ -789,7 +789,6 @@
     flex: 1;
     min-width: 0;
     padding: 0 clamp(1rem, 4vw, 3.2rem) 4rem;
-    max-width: 88rem;
   }
 
   .ambient {
