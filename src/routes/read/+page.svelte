@@ -32,6 +32,7 @@
     setCachedLibraryMetadata,
   } from "$lib/library/librarySnapshotCache";
   import type { TypstOutlineItem } from "$lib/typst/outlineTypst";
+  import { toastError } from "$lib/ui/toast.svelte";
 
   const QUOTE_ACCENTS: QuoteAccent[] = ["sand", "sage", "dustyRose", "ink"];
 
@@ -228,7 +229,7 @@
       await exportTranslatedPdfToLibrary(bookPath);
       await loadSnapshot();
     } catch (e) {
-      alert(e instanceof Error ? e.message : String(e));
+      toastError(e, "Экспорт перевода");
     } finally {
       pdfExportBusy = false;
     }

@@ -25,6 +25,7 @@
   import DreamSelect from "$lib/components/DreamSelect.svelte";
   import { isTauriRuntime } from "$lib/isTauri";
   import { exportBookToTypst } from "$lib/typst/exportToTypst";
+  import { toastError } from "$lib/ui/toast.svelte";
 
   let snapshot = $state<LibrarySnapshot | null>(getCachedLibrarySnapshot());
   let shelfFilter = $state<string>("all");
@@ -49,8 +50,8 @@
   } | null>(null);
 
   let fullTranslateBook = $state<string | null>(null);
-  const pendingCoverUpdates = new Map<string, string>();
-  let coverSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  const pendingMetaPatches = new Map<string, Partial<BookMeta>>();
+  let metaPatchTimer: ReturnType<typeof setTimeout> | null = null;
 
   const IMPORTANCE_ORDER: Record<string, number> = {
     essential: 0,
@@ -215,7 +216,7 @@
       await refresh();
       await goto("/read?path=" + encodeURIComponent(mainRelativePath));
     } catch (e) {
-      alert(e instanceof Error ? e.message : String(e));
+      toastError(e, "Экспорт в Typst");
     }
   }
 
@@ -247,30 +248,28 @@
     }
   }
 
-  function cacheBookCover(path: string, dataUrl: string) {
-    if (snapshot?.metadata.books[path]?.coverThumbDataUrl === dataUrl) return;
-    pendingCoverUpdates.set(path, dataUrl);
-    if (coverSaveTimer) clearTimeout(coverSaveTimer);
-    coverSaveTimer = setTimeout(() => {
-      coverSaveTimer = null;
-      void flushCoverUpdates();
-    }, 900);
+  /** Название и автор из файла книги — только если пользователь их не задавал. */
+  function applyDiscoveredMeta(path: string, m: { title: string | null; author: string | null }) {
+    const cur = snapshot?.metadata.books[path];
+    if (!cur || cur.autoMetaDone) return;
+    const patch: Partial<BookMeta> = { autoMetaDone: true };
+    if (!cur.title?.trim() && m.title) patch.title = m.title;
+    if (!cur.author?.trim() && m.author) patch.author = m.author;
+    pendingMetaPatches.set(path, patch);
+    if (metaPatchTimer) clearTimeout(metaPatchTimer);
+    metaPatchTimer = setTimeout(flushMetaPatches, 700);
   }
 
-  async function flushCoverUpdates() {
-    if (!snapshot || pendingCoverUpdates.size === 0) return;
-    const updates = [...pendingCoverUpdates];
-    pendingCoverUpdates.clear();
+  function flushMetaPatches() {
+    metaPatchTimer = null;
+    if (!snapshot || pendingMetaPatches.size === 0) return;
     const books = { ...snapshot.metadata.books };
-    for (const [path, dataUrl] of updates) {
+    for (const [path, patch] of pendingMetaPatches) {
       const current = books[path];
-      if (current) books[path] = { ...current, coverThumbDataUrl: dataUrl };
+      if (current) books[path] = { ...current, ...patch };
     }
-    try {
-      await persist({ ...snapshot.metadata, books });
-    } catch {
-      for (const [path, dataUrl] of updates) pendingCoverUpdates.set(path, dataUrl);
-    }
+    pendingMetaPatches.clear();
+    void persist({ ...snapshot.metadata, books }).catch(() => {});
   }
 
   function patchBook(path: string, patch: Partial<BookMeta>) {
@@ -443,8 +442,8 @@
   });
 
   onDestroy(() => {
-    if (coverSaveTimer) clearTimeout(coverSaveTimer);
-    void flushCoverUpdates();
+    if (metaPatchTimer) clearTimeout(metaPatchTimer);
+    flushMetaPatches();
   });
 
   $effect(() => {
@@ -694,10 +693,8 @@
                   <BookCoverThumb
                     bookPath={p}
                     format={fmt}
-                    cachedUrl={meta?.coverThumbDataUrl ?? null}
-                    onCached={(u) => {
-                      cacheBookCover(p, u);
-                    }}
+                    needMeta={!!meta && !meta.autoMetaDone}
+                    onMeta={(m) => applyDiscoveredMeta(p, m)}
                   >
                     <span class="cover-k">{fmt ? formatBadgeLabel(fmt) : "?"}</span>
                   </BookCoverThumb>
@@ -867,7 +864,6 @@
           <BookCoverThumb
             bookPath={editPath}
             format={getBookFormat(editPath)}
-            cachedUrl={editMeta.coverThumbDataUrl ?? null}
           >
             <span class="edit-cover-mark">{getBookFormat(editPath)?.toUpperCase() ?? "BOOK"}</span>
           </BookCoverThumb>

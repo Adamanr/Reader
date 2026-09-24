@@ -6,6 +6,35 @@ export interface Shelf {
   order: number;
 }
 
+export type ReadingStatus = "want" | "reading" | "done" | "dropped";
+
+export const READING_STATUS_OPTIONS: { value: ReadingStatus; label: string }[] = [
+  { value: "want", label: "Хочу прочитать" },
+  { value: "reading", label: "Читаю" },
+  { value: "done", label: "Прочитано" },
+  { value: "dropped", label: "Отложено" },
+];
+
+export type HighlightColor = "yellow" | "green" | "blue" | "pink" | "violet";
+
+export interface Highlight {
+  id: string;
+  text: string;
+  color: HighlightColor;
+  /** Заметка на полях (необязательно). */
+  note?: string;
+  /** PDF: страница (1-based). */
+  page?: number;
+  /** EPUB: CFI-диапазон выделения. */
+  cfi?: string;
+  /** FB2: индекс блока (абзаца) и смещение текста внутри него. */
+  block?: number;
+  /** Смещение начала в тексте блока/страницы (для поиска фрагмента). */
+  offset?: number;
+  chapterLabel?: string;
+  createdAt: string;
+}
+
 export interface BookComment {
   id: string;
   body: string;
@@ -91,6 +120,20 @@ export interface BookMeta {
    * Если не задан — при экспорте в Typst подставляется общий стиль из настроек; сам проект всё равно содержит локальный `theme.typ`.
    */
   typstStyleRelativePath?: string | null;
+  /** Статус чтения; если не задан — выводится из прогресса. */
+  status?: ReadingStatus | null;
+  /** Общий прогресс 0…1 для всех форматов. */
+  progress?: number | null;
+  /** EPUB: href текущей главы (для оглавления), когда lastReadLocation — CFI. */
+  lastReadHref?: string | null;
+  highlights?: Highlight[];
+  /** Время добавления в библиотеку (мс, ставит бэкенд). */
+  addedAtMs?: number | null;
+  finishedAt?: string | null;
+  /** Метаданные файла заполнены автоматически (не перезаписывать ручные). */
+  autoMetaDone?: boolean | null;
+  /** Фоновый звук, привязанный к книге. */
+  ambientSound?: string | null;
 }
 
 export interface LibraryMetadata {
@@ -105,6 +148,8 @@ export interface LibrarySnapshot {
   metadata: LibraryMetadata;
   /** Общий стиль Typst по умолчанию (путь относительно корня библиотеки). */
   defaultTypstStyleRelativePath?: string | null;
+  /** Данные лежат в `<библиотека>/.reader` и синхронизируются вместе с книгами. */
+  syncInLibrary?: boolean;
 }
 
 export const IMPORTANCE_OPTIONS: { value: Importance; label: string }[] = [

@@ -1,6 +1,7 @@
 <script>import "../app.css";
 import { browser } from "$app/environment";
 import { initThemeFromStorage } from "$lib/theme";
+import Toaster from "$lib/components/Toaster.svelte";
 
 let { children } = $props();
 
@@ -11,6 +12,7 @@ if (browser) {
 <div class="app-root">
   {@render children()}
 </div>
+<Toaster />
 
 
 <style>

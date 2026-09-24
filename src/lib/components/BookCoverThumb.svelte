@@ -1,35 +1,36 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import { onMount } from "svelte";
-  import { isTauriRuntime } from "$lib/isTauri";
   import { getBookFormat } from "$lib/bookFormat";
-  import { enqueueCoverGeneration } from "$lib/library/coverLoadQueue";
+  import { loadCover, peekCover, type DiscoveredMeta } from "$lib/covers/coverCache";
 
   interface Props {
     bookPath: string;
-    /** Уже сохранённое превью из метаданных */
-    cachedUrl?: string | null;
     format: ReturnType<typeof getBookFormat>;
-    /** Сохранить миниатюру в метаданные (родитель вызывает patchBook) */
-    onCached?: (dataUrl: string) => void;
+    /** Прочитать из файла название и автора (однократно для новой книги). */
+    needMeta?: boolean;
+    onMeta?: (m: DiscoveredMeta) => void;
+    /** Сообщает родителю адрес обложки (для палитры и корешков). */
+    onCover?: (url: string | null) => void;
+    /** Грузить сразу, не дожидаясь появления на экране. */
+    eager?: boolean;
     children?: Snippet;
   }
-  let { bookPath, cachedUrl = null, format, onCached, children }: Props = $props();
+  let { bookPath, format, needMeta = false, onMeta, onCover, eager = false, children }: Props = $props();
 
   let root: HTMLDivElement | undefined = $state(undefined);
   let visible = $state(false);
   let src = $state<string | null>(null);
-  let tried = $state(false);
 
   $effect(() => {
-    if (cachedUrl && visible) {
-      src = cachedUrl;
-    }
+    // Мгновенно показываем то, что уже есть в памяти.
+    const known = peekCover(bookPath);
+    src = known ?? null;
   });
 
   onMount(() => {
-    if (!cachedUrl && (!format || format === "epub" || format === "typst" || !isTauriRuntime())) {
-      tried = true;
+    if (eager) {
+      visible = true;
       return;
     }
     const el = root;
@@ -50,7 +51,7 @@
           io.disconnect();
         }
       },
-      { root: null, rootMargin: "100px 0px", threshold: 0.01 },
+      { root: null, rootMargin: "200px 0px", threshold: 0.01 },
     );
     io.observe(el);
     return () => {
@@ -61,35 +62,24 @@
   });
 
   $effect(() => {
-    if (cachedUrl) return;
-    if (!visible || tried) return;
-    if (!format || format === "epub" || format === "typst") {
-      tried = true;
-      return;
-    }
-    if (!isTauriRuntime()) {
-      tried = true;
-      return;
-    }
-    tried = true;
-    void enqueueCoverGeneration(async () => {
-      try {
-        const { buildBookCoverDataUrl } = await import("$lib/covers/bookCover");
-        const u = await buildBookCoverDataUrl(bookPath, format);
-        if (u && u.length < 120_000) {
-          src = u;
-          onCached?.(u);
-        }
-      } catch {
-        /* обложка необязательна */
-      }
+    if (!visible) return;
+    const path = bookPath;
+    const fmt = format;
+    let alive = true;
+    void loadCover(path, fmt, { needMeta, onMeta }).then((u) => {
+      if (!alive) return;
+      src = u;
+      onCover?.(u);
     });
+    return () => {
+      alive = false;
+    };
   });
 </script>
 
 <div class="thumb-root" bind:this={root}>
   {#if src}
-    <img class="thumb-img" src={src} alt="" loading="lazy" decoding="async" />
+    <img class="thumb-img" src={src} alt="" decoding="async" />
   {:else}
     <span class="thumb-fallback">{@render children?.()}</span>
   {/if}

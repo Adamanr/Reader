@@ -94,6 +94,9 @@ pub struct BookMeta {
     /// Путь к файлу стиля `.typ` относительно корня библиотеки; None — общий стиль из настроек.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typst_style_relative_path: Option<String>,
+    /// Поля, которые знает только фронтенд (статус, выделения, прогресс…): сохраняем как есть.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,6 +104,8 @@ pub struct BookMeta {
 pub struct LibraryMetadata {
     pub shelves: Vec<Shelf>,
     pub books: HashMap<String, BookMeta>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -110,6 +115,10 @@ pub struct AppConfig {
     /// Путь к `.typ` теме по умолчанию (относительно папки библиотеки), например `.reader-typst-themes/minimal.typ`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_typst_style_relative_path: Option<String>,
+    /// Хранить метаданные, заметки и обложки в `<библиотека>/.reader/` —
+    /// тогда их синхронизирует Syncthing/Nextcloud вместе с книгами.
+    #[serde(default)]
+    pub sync_in_library: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,7 +130,11 @@ pub struct LibrarySnapshot {
     pub metadata: LibraryMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_typst_style_relative_path: Option<String>,
+    pub sync_in_library: bool,
 }
+
+/// Служебная папка внутри библиотеки (не сканируется как книги).
+const LIBRARY_DATA_DIR: &str = ".reader";
 
 fn app_dir(_app: &AppHandle) -> PathBuf {
     let dir = dirs::config_dir()
@@ -131,8 +144,25 @@ fn app_dir(_app: &AppHandle) -> PathBuf {
     dir
 }
 
+/// Каталог данных: папка приложения или `<библиотека>/.reader` при синхронизации.
+fn data_dir(app: &AppHandle) -> PathBuf {
+    if let Ok(c) = load_config(app) {
+        if c.sync_in_library {
+            if let Some(root) = c.library_root.as_deref() {
+                let root = Path::new(root);
+                if root.is_dir() {
+                    let d = root.join(LIBRARY_DATA_DIR);
+                    let _ = std::fs::create_dir_all(&d);
+                    return d;
+                }
+            }
+        }
+    }
+    app_dir(app)
+}
+
 fn pdf_translations_dir(app: &AppHandle) -> PathBuf {
-    let d = app_dir(app).join("pdf-translations");
+    let d = data_dir(app).join("pdf-translations");
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -149,7 +179,48 @@ fn config_path(app: &AppHandle) -> PathBuf {
 }
 
 fn metadata_path(app: &AppHandle) -> PathBuf {
-    app_dir(app).join("library-metadata.json")
+    data_dir(app).join("library-metadata.json")
+}
+
+fn covers_dir(app: &AppHandle) -> PathBuf {
+    let d = data_dir(app).join("covers");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+fn store_dir(app: &AppHandle) -> PathBuf {
+    let d = data_dir(app).join("store");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+fn path_hash(s: &str) -> String {
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}
+
+fn cover_file(app: &AppHandle, book_relative_path: &str) -> PathBuf {
+    covers_dir(app).join(format!("{}.txt", path_hash(book_relative_path)))
+}
+
+/// Имя записи хранилища: только `[a-z0-9._-]`, без обхода каталогов.
+fn store_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let ok = !name.is_empty()
+        && name.len() <= 120
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        return Err("Недопустимое имя записи".into());
+    }
+    Ok(store_dir(app).join(format!("{name}.json")))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
@@ -164,7 +235,7 @@ fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
 fn save_config(app: &AppHandle, c: &AppConfig) -> Result<(), String> {
     let p = config_path(app);
     let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    std::fs::write(&p, s).map_err(|e| e.to_string())
+    atomic_write(&p, s.as_bytes())
 }
 
 fn default_metadata() -> LibraryMetadata {
@@ -175,6 +246,7 @@ fn default_metadata() -> LibraryMetadata {
             order: 0,
         }],
         books: HashMap::new(),
+        extra: Default::default(),
     }
 }
 
@@ -188,13 +260,25 @@ fn load_metadata(app: &AppHandle) -> Result<LibraryMetadata, String> {
     if m.shelves.is_empty() {
         m.shelves = default_metadata().shelves;
     }
+    // Раньше миниатюры обложек лежали прямо в JSON и раздували его до мегабайт.
+    // Переносим их в отдельные файлы один раз.
+    let mut migrated = false;
+    for (path, book) in m.books.iter_mut() {
+        if let Some(url) = book.cover_thumb_data_url.take() {
+            let _ = atomic_write(&cover_file(app, path), url.as_bytes());
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_metadata(app, &m)?;
+    }
     Ok(m)
 }
 
 fn save_metadata(app: &AppHandle, m: &LibraryMetadata) -> Result<(), String> {
     let p = metadata_path(app);
     let s = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
-    std::fs::write(&p, s).map_err(|e| e.to_string())
+    atomic_write(&p, s.as_bytes())
 }
 
 /// Безопасный путь под корнем библиотеки. Цель может ещё не существовать (экспорт Typst и т.д.),
@@ -260,7 +344,10 @@ fn scan_library(root: &Path) -> Result<Vec<String>, String> {
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+    let walker = WalkDir::new(&root)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != LIBRARY_DATA_DIR);
+    for entry in walker.filter_map(|e| e.ok()) {
         let p = entry.path();
         if !p.is_file() {
             continue;
@@ -305,6 +392,11 @@ fn merge_scan_into_metadata(paths: &[String], meta: &mut LibraryMetadata) -> boo
                     cover_thumb_data_url: None,
                     last_opened_at: None,
                     typst_style_relative_path: None,
+                    extra: {
+                        let mut extra = serde_json::Map::new();
+                        extra.insert("addedAtMs".into(), serde_json::json!(now_ms()));
+                        extra
+                    },
                 },
             );
             changed = true;
@@ -335,6 +427,7 @@ fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
                 hidden_book_paths: vec![],
                 metadata,
                 default_typst_style_relative_path,
+                sync_in_library: config.sync_in_library,
             });
         }
     };
@@ -354,6 +447,7 @@ fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
         hidden_book_paths,
         metadata,
         default_typst_style_relative_path,
+        sync_in_library: config.sync_in_library,
     })
 }
 
@@ -417,6 +511,156 @@ fn delete_library_book(app: AppHandle, relative_path: String) -> Result<(), Stri
     let translation = pdf_translation_file(&app, &relative_path);
     if translation.exists() {
         let _ = std::fs::remove_file(translation);
+    }
+    let _ = std::fs::remove_file(cover_file(&app, &relative_path));
+    Ok(())
+}
+
+#[tauri::command]
+fn cover_get(app: AppHandle, book_relative_path: String) -> Result<Option<String>, String> {
+    let p = cover_file(&app, &book_relative_path);
+    if !p.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&p)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cover_set(app: AppHandle, book_relative_path: String, data_url: String) -> Result<(), String> {
+    if !data_url.starts_with("data:image/") || data_url.len() > 400_000 {
+        return Err("Некорректная обложка".into());
+    }
+    atomic_write(&cover_file(&app, &book_relative_path), data_url.as_bytes())
+}
+
+#[tauri::command]
+fn store_read(app: AppHandle, name: String) -> Result<Option<String>, String> {
+    let p = store_file(&app, &name)?;
+    if !p.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&p)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn store_write(app: AppHandle, name: String, json: String) -> Result<(), String> {
+    let p = store_file(&app, &name)?;
+    atomic_write(&p, json.as_bytes())
+}
+
+/// Копирует файлы с диска (перетаскивание в окно) в корень библиотеки.
+/// Возвращает относительные пути добавленных книг.
+#[tauri::command]
+fn import_books(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
+    let config = load_config(&app)?;
+    let root = config
+        .library_root
+        .ok_or("Сначала выберите папку библиотеки")?;
+    let root = PathBuf::from(root)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let mut added = Vec::new();
+    for src in paths {
+        let src = PathBuf::from(src);
+        if !src.is_file() {
+            continue;
+        }
+        let Some(ext) = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
+        };
+        if !matches!(ext.as_str(), "pdf" | "epub" | "fb2") {
+            continue;
+        }
+        let stem = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("book")
+            .to_string();
+        if let Ok(canon) = src.canonicalize() {
+            if canon.starts_with(&root) {
+                // Уже внутри библиотеки — просто покажем её.
+                if let Ok(rel) = canon.strip_prefix(&root) {
+                    added.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+                continue;
+            }
+        }
+        let mut dest = root.join(format!("{stem}.{ext}"));
+        let mut n = 2;
+        while dest.exists() {
+            dest = root.join(format!("{stem} ({n}).{ext}"));
+            n += 1;
+        }
+        std::fs::copy(&src, &dest).map_err(|e| format!("Копирование: {e}"))?;
+        if let Ok(rel) = dest.strip_prefix(&root) {
+            added.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(added)
+}
+
+/// Включает/выключает хранение данных в папке библиотеки.
+/// При включении копирует текущие данные туда, если там ещё ничего нет;
+/// если данные уже есть (пришли с другого устройства) — использует их.
+#[tauri::command]
+fn set_sync_in_library(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut c = load_config(&app)?;
+    if c.sync_in_library == enabled {
+        return Ok(());
+    }
+    let root = c
+        .library_root
+        .clone()
+        .ok_or("Сначала выберите папку библиотеки")?;
+    let lib_dir = Path::new(&root).join(LIBRARY_DATA_DIR);
+    let local_dir = app_dir(&app);
+    let (from, to) = if enabled {
+        (local_dir, lib_dir)
+    } else {
+        (lib_dir, local_dir)
+    };
+    std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
+    if !to.join("library-metadata.json").exists() {
+        copy_data_tree(&from, &to)?;
+    }
+    c.sync_in_library = enabled;
+    save_config(&app, &c)
+}
+
+fn copy_data_tree(from: &Path, to: &Path) -> Result<(), String> {
+    for name in ["library-metadata.json"] {
+        let src = from.join(name);
+        if src.is_file() {
+            std::fs::copy(&src, to.join(name)).map_err(|e| e.to_string())?;
+        }
+    }
+    for dir in ["covers", "store", "pdf-translations"] {
+        let src = from.join(dir);
+        if !src.is_dir() {
+            continue;
+        }
+        let dst = to.join(dir);
+        std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(&src)
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            let p = entry.path();
+            if p.is_file() {
+                let target = dst.join(entry.file_name());
+                if !target.exists() {
+                    std::fs::copy(&p, target).map_err(|e| e.to_string())?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -989,6 +1233,12 @@ pub fn run() {
             typst_cli_version,
             llm_chat_completion,
             llm_list_models,
+            cover_get,
+            cover_set,
+            store_read,
+            store_write,
+            import_books,
+            set_sync_in_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
