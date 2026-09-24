@@ -48,7 +48,7 @@
   import { reading, updateReading } from "$lib/reading/settings.svelte";
   import { coverAccentVars, coverTone, pagePalette, type CoverTone } from "$lib/reading/palette";
   import { loadCover } from "$lib/covers/coverCache";
-  import { startSession } from "$lib/reading/stats.svelte";
+  import { minutesLeft, startSession } from "$lib/reading/stats.svelte";
   import { bookNotesMarkdown, saveMarkdown } from "$lib/reading/exportNotes";
   import { writeTextToClipboard } from "$lib/clipboardWrite";
   import { isTauriRuntime } from "$lib/isTauri";
@@ -343,6 +343,13 @@
     toast("Книга дочитана — поздравляю! ✦", "success");
   }
 
+  function bookMinutesLeft(): number | null {
+    const p = position;
+    if (!p) return null;
+    const m = minutesLeft({ charsLeft: p.charsLeftBook, pagesLeft: p.pagesLeftBook });
+    return m == null ? null : Math.round(m);
+  }
+
   function onPosition(p: ReadingPosition) {
     position = p;
     session?.position({ charsLeftBook: p.charsLeftBook, page: fmt === "pdf" ? pdfPage : null });
@@ -359,6 +366,7 @@
         lastReadLocationLabel: p.label,
         lastReadHref: p.href || null,
         progress: p.progress,
+        minutesLeft: bookMinutesLeft(),
       });
       maybeFinish(p.progress);
       locSaveTimer = null;
@@ -396,7 +404,13 @@
       if (pdfProgTimer) clearTimeout(pdfProgTimer);
       pdfProgTimer = setTimeout(() => {
         const progress = position?.progress ?? pg / total;
-        patchBook(path, { lastReadPdfPage: pg, lastReadPdfTotal: total, progress });
+        patchBook(path, {
+          lastReadPdfPage: pg,
+          lastReadPdfTotal: total,
+          progress,
+          lastReadLocationLabel: position?.chapterLabel || null,
+          minutesLeft: bookMinutesLeft(),
+        });
         maybeFinish(pg >= total ? 1 : progress);
         pdfProgTimer = null;
       }, 500);

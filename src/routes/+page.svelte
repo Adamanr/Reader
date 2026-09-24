@@ -3,8 +3,8 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
-  import type { BookMeta, Importance, LibraryMetadata, LibrarySnapshot, Shelf } from "$lib/types";
-  import { IMPORTANCE_OPTIONS } from "$lib/types";
+  import type { BookMeta, Importance, LibraryMetadata, LibrarySnapshot, ReadingStatus, Shelf } from "$lib/types";
+  import { IMPORTANCE_OPTIONS, READING_STATUS_OPTIONS } from "$lib/types";
   import { formatBadgeLabel, getBookFormat } from "$lib/bookFormat";
   import { bookOnShelf, effectiveShelfIds } from "$lib/library/shelves";
   import {
@@ -18,20 +18,38 @@
     LIBRARY_SORT_LABELS,
     readLibrarySort,
     writeLibrarySort,
+    readLibraryView,
+    writeLibraryView,
+    type LibraryViewMode,
   } from "$lib/library/libraryListPrefs";
+  import ContinueReading from "$lib/components/ContinueReading.svelte";
+  import SpineShelf from "$lib/components/SpineShelf.svelte";
+  import RhythmCard from "$lib/components/RhythmCard.svelte";
+  import {
+    STATUS_LABELS,
+    bookProgress,
+    dustLabel,
+    dustLevel,
+    effectiveStatus,
+    pluralBooks,
+    type ShelfStatus,
+  } from "$lib/library/bookInfo";
   import SettingsThemeCard from "$lib/components/SettingsThemeCard.svelte";
   import BookFullTranslateModal from "$lib/components/BookFullTranslateModal.svelte";
   import BookCoverThumb from "$lib/components/BookCoverThumb.svelte";
   import DreamSelect from "$lib/components/DreamSelect.svelte";
   import { isTauriRuntime } from "$lib/isTauri";
   import { exportBookToTypst } from "$lib/typst/exportToTypst";
-  import { toastError } from "$lib/ui/toast.svelte";
+  import { toast, toastError } from "$lib/ui/toast.svelte";
 
   let snapshot = $state<LibrarySnapshot | null>(getCachedLibrarySnapshot());
   let shelfFilter = $state<string>("all");
   let newShelfName = $state("");
   let banner = $state<string | null>(null);
   let searchQuery = $state("");
+  let statusFilter = $state<ShelfStatus | "all">("all");
+  let viewMode = $state<LibraryViewMode>("grid");
+  let dragActive = $state(false);
   let mobileLibraryOpen = $state(false);
 
   let ctxMenu = $state<{ x: number; y: number; path: string } | null>(null);
@@ -45,6 +63,7 @@
     author: string;
     typstStyleRelativePath: string;
     importance: Importance;
+    status: ReadingStatus | "";
     shelfIds: string[];
     review: string;
   } | null>(null);
@@ -64,7 +83,13 @@
 
   onMount(() => {
     librarySort = readLibrarySort();
+    viewMode = readLibraryView();
   });
+
+  function setViewMode(mode: LibraryViewMode) {
+    viewMode = mode;
+    writeLibraryView(mode);
+  }
 
   function setLibrarySort(mode: LibrarySortMode) {
     librarySort = mode;
@@ -98,6 +123,18 @@
         const xb = (mb?.title?.trim() || titleFromPath(b)).toLowerCase();
         return xb.localeCompare(xa, "ru");
       }
+      case "added": {
+        const ta = ma?.addedAtMs ?? 0;
+        const tb = mb?.addedAtMs ?? 0;
+        if (tb !== ta) return tb - ta;
+        break;
+      }
+      case "progress": {
+        const pa = bookProgress(ma) ?? -1;
+        const pb = bookProgress(mb) ?? -1;
+        if (pb !== pa) return pb - pa;
+        break;
+      }
       case "importance": {
         const ia = IMPORTANCE_ORDER[String(ma?.importance ?? "normal")] ?? 2;
         const ib = IMPORTANCE_ORDER[String(mb?.importance ?? "normal")] ?? 2;
@@ -124,6 +161,9 @@
         bookOnShelf(snapshot!.metadata.books[p], shelfFilter),
       );
     }
+    if (statusFilter !== "all") {
+      paths = paths.filter((p) => effectiveStatus(snapshot!.metadata.books[p]) === statusFilter);
+    }
     const query = searchQuery.trim().toLocaleLowerCase("ru");
     if (query) {
       paths = paths.filter((p) => {
@@ -136,6 +176,87 @@
       });
     }
     return paths.slice().sort(cmpBookPaths);
+  });
+
+  /** Книги «в процессе» для блока «Продолжить чтение». */
+  const continueBooks = $derived.by(() => {
+    if (!snapshot) return [];
+    return snapshot.bookPaths
+      .map((path) => ({ path, meta: snapshot!.metadata.books[path]! }))
+      .filter((b) => b.meta?.lastOpenedAt && effectiveStatus(b.meta) === "reading")
+      .sort((a, b) => Date.parse(b.meta.lastOpenedAt!) - Date.parse(a.meta.lastOpenedAt!))
+      .slice(0, 4);
+  });
+
+  const statusCounts = $derived.by(() => {
+    const c: Record<string, number> = {};
+    if (!snapshot) return c;
+    const base =
+      shelfFilter === "all" || shelfFilter === "hidden"
+        ? snapshot.bookPaths
+        : snapshot.bookPaths.filter((p) => bookOnShelf(snapshot!.metadata.books[p], shelfFilter));
+    for (const p of base) {
+      const st = effectiveStatus(snapshot.metadata.books[p]);
+      c[st] = (c[st] ?? 0) + 1;
+    }
+    return c;
+  });
+
+  const STATUS_FILTERS: (ShelfStatus | "all")[] = ["all", "reading", "new", "want", "done", "dropped"];
+
+  function setBookStatus(path: string, status: ReadingStatus) {
+    const patch: Partial<BookMeta> = { status };
+    if (status === "done") patch.finishedAt = new Date().toISOString();
+    patchBook(path, patch);
+  }
+
+  // ——— Импорт книг: кнопка и перетаскивание файлов в окно ———
+  async function importPaths(paths: string[]) {
+    if (!paths.length) return;
+    if (!snapshot?.libraryRoot) {
+      toast("Сначала выберите папку библиотеки", "error");
+      return;
+    }
+    try {
+      const added = await invoke<string[]>("import_books", { paths });
+      await refresh();
+      if (added.length) toast(`Добавлено: ${added.length} ${pluralBooks(added.length)}`, "success");
+      else toast("Подходящих файлов нет — поддерживаются PDF, EPUB и FB2", "info");
+    } catch (e) {
+      toastError(e, "Импорт");
+    }
+  }
+
+  async function pickBooks() {
+    const picked = await open({
+      multiple: true,
+      filters: [{ name: "Книги", extensions: ["pdf", "epub", "fb2"] }],
+    });
+    if (!picked) return;
+    await importPaths(Array.isArray(picked) ? picked : [picked]);
+  }
+
+  onMount(() => {
+    if (!isTauriRuntime()) return;
+    let unlisten: (() => void) | null = null;
+    let alive = true;
+    void import("@tauri-apps/api/webview").then(async ({ getCurrentWebview }) => {
+      const un = await getCurrentWebview().onDragDropEvent((event) => {
+        const t = event.payload.type;
+        if (t === "enter" || t === "over") dragActive = true;
+        else if (t === "leave") dragActive = false;
+        else if (t === "drop") {
+          dragActive = false;
+          void importPaths(event.payload.paths);
+        }
+      });
+      if (alive) unlisten = un;
+      else un();
+    });
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
   });
 
   function selectShelf(id: string) {
@@ -179,24 +300,18 @@
   function readingProgress(
     meta: BookMeta | undefined,
     fmt: NonNullable<ReturnType<typeof getBookFormat>>,
-  ): { kind: "pdf"; pct: number; label: string } | { kind: "loc"; label: string } | null {
+  ): { pct: number | null; label: string } | null {
     if (!meta) return null;
-    if (fmt === "pdf") {
-      const t = meta.lastReadPdfTotal;
-      const p = meta.lastReadPdfPage;
-      if (t != null && t > 0 && p != null && p >= 1) {
-        return {
-          kind: "pdf",
-          pct: Math.min(100, Math.round((p / t) * 100)),
-          label: `стр. ${p} / ${t}`,
-        };
-      }
-      return null;
-    }
-    if ((fmt === "epub" || fmt === "fb2") && meta.lastReadLocationLabel?.trim()) {
-      return { kind: "loc", label: meta.lastReadLocationLabel.trim() };
-    }
-    return null;
+    const p = bookProgress(meta);
+    const chapter = meta.lastReadLocationLabel?.trim() ?? "";
+    if (p == null && !chapter) return null;
+    const pct = p != null ? Math.round(p * 100) : null;
+    const parts: string[] = [];
+    if (pct != null) parts.push(`${pct}%`);
+    if (fmt === "pdf" && meta.lastReadPdfPage && meta.lastReadPdfTotal) {
+      parts.push(`стр. ${meta.lastReadPdfPage} / ${meta.lastReadPdfTotal}`);
+    } else if (chapter) parts.push(chapter);
+    return { pct, label: parts.join(" · ") };
   }
 
   async function exportBookToTypstFromMenu() {
@@ -300,7 +415,7 @@
   function onCardContextMenu(e: MouseEvent, p: string) {
     e.preventDefault();
     const menuWidth = 224;
-    const menuHeight = 300;
+    const menuHeight = 380;
     ctxMenu = {
       x: Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 12)),
       y: Math.max(12, Math.min(e.clientY, window.innerHeight - menuHeight - 12)),
@@ -380,6 +495,7 @@
           importance: (IMPORTANCE_OPTIONS.some((o) => o.value === m.importance)
             ? m.importance
             : "normal") as Importance,
+          status: m.status ?? "",
           shelfIds: [...effectiveShelfIds(m)],
           review: m.review ?? "",
         };
@@ -401,6 +517,7 @@
       author: editDraft.author.trim() || null,
       typstStyleRelativePath: editDraft.typstStyleRelativePath.trim() || null,
       importance: editDraft.importance,
+      status: editDraft.status || null,
       shelfIds,
       shelfId: shelfIds[0] ?? "default",
       review: editDraft.review,
@@ -471,6 +588,15 @@
 </script>
 
 <div class="home">
+  {#if dragActive}
+    <div class="drop-overlay" aria-hidden="true">
+      <div class="drop-card">
+        <span class="drop-icon">⤓</span>
+        <p>Отпустите, чтобы добавить книги в библиотеку</p>
+        <small>PDF, EPUB, FB2 — файлы скопируются в папку библиотеки</small>
+      </div>
+    </div>
+  {/if}
   <div class="home-ambient" aria-hidden="true"></div>
   <div class="home-film" aria-hidden="true"></div>
 
@@ -492,6 +618,16 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h16" /></svg>
         Полки
       </button>
+      {#if snapshot?.libraryRoot}
+        <button type="button" class="home-btn home-btn-ghost" onclick={() => void pickBooks()} title="Добавить книги (или перетащите файлы в окно)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          <span class="action-label">Добавить</span>
+        </button>
+      {/if}
+      <a href="/notes" class="home-btn home-btn-ghost" title="Все заметки и выделения">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h9l3 3v13H6z" /><path d="M9 11h6M9 15h4" /></svg>
+        <span class="action-label">Заметки</span>
+      </a>
       <button type="button" class="home-btn home-btn-ghost" onclick={() => void refresh()}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" /></svg>
         <span class="action-label">Обновить</span>
@@ -583,6 +719,8 @@
           </div>
         </section>
 
+        <RhythmCard />
+
         <section class="home-panel home-panel-settings">
           <SettingsThemeCard />
         </section>
@@ -625,13 +763,16 @@
           </p>
         </div>
       {:else}
+        {#if shelfFilter === "all" && statusFilter === "all" && !searchQuery.trim() && continueBooks.length}
+          <ContinueReading books={continueBooks} onOpen={openBook} />
+        {/if}
         <div class="stage-head">
           <div class="stage-intro">
-            <p class="stage-kicker">архив снов</p>
+            <p class="stage-kicker">{shelfFilter === "hidden" ? "вне полок" : "библиотека"}</p>
             <h1 class="stage-title">{stageHeading}</h1>
             <p class="stage-meta">
               {displayedBooks.length}
-              {displayedBooks.length === 1 ? "книга" : displayedBooks.length < 5 ? "книги" : "книг"}
+              {pluralBooks(displayedBooks.length)}
               {#if shelfFilter !== "all"}
                 <span class="stage-dot">·</span>
                 <span>{shelfFilter === "hidden" ? "не показываются в библиотеке" : "активная полка"}</span>
@@ -644,6 +785,14 @@
               <span class="sr-only">Поиск книг</span>
               <input type="search" placeholder="Название или автор" bind:value={searchQuery} />
             </label>
+            <div class="view-toggle" role="group" aria-label="Вид">
+              <button type="button" class:on={viewMode === "grid"} title="Обложки" aria-label="Обложки" onclick={() => setViewMode("grid")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="9" rx="1.5" /><rect x="13" y="4" width="7" height="9" rx="1.5" /><path d="M4 17h16M4 20h10" /></svg>
+              </button>
+              <button type="button" class:on={viewMode === "spines"} title="Корешки на полке" aria-label="Корешки" onclick={() => setViewMode("spines")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v15M9 6v13M13 3v16M17.5 6.5l3 12M3 20.5h18" /></svg>
+              </button>
+            </div>
             <div class="sort-shell">
               <span class="sr-only">Упорядочить</span>
               <DreamSelect
@@ -656,13 +805,38 @@
             </div>
           </div>
         </div>
+        {#if shelfFilter !== "hidden"}
+          <div class="status-chips" role="group" aria-label="Статус чтения">
+            {#each STATUS_FILTERS as st (st)}
+              {#if st === "all" || statusCounts[st]}
+                <button type="button" class="status-chip" class:on={statusFilter === st} onclick={() => (statusFilter = st)}>
+                  {st === "all" ? "Все" : STATUS_LABELS[st]}
+                  {#if st !== "all"}<span>{statusCounts[st]}</span>{/if}
+                </button>
+              {/if}
+            {/each}
+          </div>
+        {/if}
         {#if displayedBooks.length === 0}
           <div class="search-empty">
             <span class="search-empty-mark" aria-hidden="true">Aa</span>
             <h2>Книги не найдены</h2>
             <p>Попробуйте изменить запрос или посмотреть другую полку.</p>
-            <button type="button" class="home-btn" onclick={() => (searchQuery = "")}>Сбросить поиск</button>
+            <button
+              type="button"
+              class="home-btn"
+              onclick={() => {
+                searchQuery = "";
+                statusFilter = "all";
+              }}>Сбросить фильтры</button>
           </div>
+        {:else if viewMode === "spines"}
+          <SpineShelf
+            paths={displayedBooks}
+            books={snapshot!.metadata.books}
+            onOpen={(p) => (bookIsHidden(p) ? undefined : openBook(p))}
+            onMenu={(e, p) => onCardContextMenu(e, p)}
+          />
         {:else}
         <ul class="book-grid">
           {#each displayedBooks as p (p)}
@@ -673,11 +847,15 @@
             {@const shelfTitle = meta?.title?.trim() ?? ""}
             {@const cardTitle = shelfTitle || fileName}
             {@const hiddenBook = bookIsHidden(p)}
+            {@const status = effectiveStatus(meta)}
+            {@const dust = dustLevel(meta)}
             <li class="book-cell">
               <button
                 type="button"
                 class="book-card"
                 class:book-card-hidden={hiddenBook}
+                style:--dust={dust.toFixed(2)}
+                title={dustLabel(meta) || undefined}
                 onclick={(e) => (hiddenBook ? onCardContextMenu(e, p) : openBook(p))}
                 oncontextmenu={(e) => onCardContextMenu(e, p)}
               >
@@ -706,16 +884,21 @@
                 {#if shelfTitle && shelfTitle !== fileName}
                   <span class="card-file">{fileName}</span>
                 {/if}
-                <span class="card-meta">{importanceLabel(meta?.importance ?? "normal")}</span>
+                <span class="card-status card-status-{status}">
+                  {STATUS_LABELS[status]}
+                  {#if meta?.importance === "essential" || meta?.importance === "high"}
+                    <span class="card-important" title={importanceLabel(meta.importance)}>★</span>
+                  {/if}
+                </span>
                 {#if hiddenBook}
                   <span class="card-badge-hidden">Скрыта</span>
                 {/if}
                 {#if meta?.translationExported}
                   <span class="card-badge-trans" title="Есть PDF translate_* с переводом">Переведена</span>
                 {/if}
-                {#if prog}
+                {#if prog && status !== "done"}
                   <div class="card-progress">
-                    {#if prog.kind === "pdf"}
+                    {#if prog.pct != null}
                       <div class="card-progress-track" aria-hidden="true">
                         <div class="card-progress-fill" style:width="{prog.pct}%"></div>
                       </div>
@@ -759,6 +942,20 @@
       </button>
     {:else}
       <button type="button" class="ctx-item" onclick={() => startEdit()}>Редактирование</button>
+      <div class="ctx-statuses" role="group" aria-label="Статус">
+        {#each READING_STATUS_OPTIONS as o (o.value)}
+          <button
+            type="button"
+            class="ctx-status"
+            class:on={snapshot?.metadata.books[ctxMenu.path]?.status === o.value}
+            onclick={() => {
+              setBookStatus(ctxMenu!.path, o.value);
+              closeCtx();
+            }}>{o.label}</button
+          >
+        {/each}
+      </div>
+      <div class="ctx-separator" aria-hidden="true"></div>
       {#if isTauriRuntime() && getBookFormat(ctxMenu.path) === "pdf"}
         <button
           type="button"
@@ -903,6 +1100,23 @@
             <input type="text" placeholder="Имя автора" bind:value={editDraft.author} />
           </label>
         </div>
+
+        <fieldset class="edit-group">
+          <legend>Статус</legend>
+          <div class="importance-options">
+            {#each READING_STATUS_OPTIONS as o (o.value)}
+              <button
+                type="button"
+                class="importance-option"
+                class:importance-option-active={editDraft.status === o.value}
+                aria-pressed={editDraft.status === o.value}
+                onclick={() => (editDraft = { ...editDraft!, status: editDraft!.status === o.value ? "" : o.value })}
+              >
+                {o.label}
+              </button>
+            {/each}
+          </div>
+        </fieldset>
 
         <fieldset class="edit-group">
           <legend>Важность</legend>
@@ -3333,6 +3547,208 @@
 
     .empty-state {
       margin-block: 1.5rem;
+    }
+  }
+
+  /* ——— Статусы, пыль, вид полки, перетаскивание ——— */
+  .status-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin: -0.3rem 0 1.1rem;
+  }
+
+  .status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    border: 1px solid color-mix(in srgb, var(--border-soft) 85%, transparent);
+    background: color-mix(in srgb, var(--panel-elevated) 70%, transparent);
+    color: var(--text-soft);
+    border-radius: 999px;
+    padding: 0.3rem 0.75rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .status-chip span {
+    font-size: 0.7rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .status-chip.on {
+    background: var(--accent-2);
+    border-color: var(--accent-2);
+    color: var(--elevated-soft);
+  }
+
+  .status-chip.on span {
+    color: inherit;
+    opacity: 0.8;
+  }
+
+  .view-toggle {
+    display: flex;
+    padding: 3px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--border-soft) 85%, transparent);
+    background: color-mix(in srgb, var(--panel-elevated) 70%, transparent);
+  }
+
+  .view-toggle button {
+    display: grid;
+    place-items: center;
+    width: 2.1rem;
+    height: 2rem;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .view-toggle button.on {
+    background: var(--elevated-soft);
+    color: var(--accent-2);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+  }
+
+  .view-toggle svg {
+    width: 1.1rem;
+    height: 1.1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .card-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    width: fit-content;
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 0.12rem 0.45rem;
+    border-radius: 999px;
+    color: var(--muted);
+    background: color-mix(in srgb, var(--border-soft) 45%, transparent);
+  }
+
+  .card-status-reading {
+    color: var(--accent-2);
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
+  .card-status-done {
+    color: #4f7d5b;
+    background: color-mix(in srgb, #94d49a 30%, transparent);
+  }
+
+  .card-status-want {
+    color: #8a6a2e;
+    background: color-mix(in srgb, #f5d565 30%, transparent);
+  }
+
+  .card-important {
+    color: #d49a2a;
+  }
+
+  .book-card .cover {
+    position: relative;
+    filter: grayscale(calc(var(--dust, 0) * 0.8)) sepia(calc(var(--dust, 0) * 0.35))
+      brightness(calc(1 - var(--dust, 0) * 0.08));
+    transition: filter 0.7s ease;
+  }
+
+  .book-card .cover::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    opacity: calc(var(--dust, 0) * 0.85);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='1.2' numOctaves='2'/><feColorMatrix values='0 0 0 0 0.86  0 0 0 0 0.83  0 0 0 0 0.78  0 0 0 0.6 0'/></filter><rect width='80' height='80' filter='url(%23n)'/></svg>");
+    transition: opacity 0.7s ease;
+  }
+
+  /* Наведение «сдувает пыль» */
+  .book-card:hover .cover {
+    filter: none;
+  }
+
+  .book-card:hover .cover::after {
+    opacity: 0;
+  }
+
+  .ctx-statuses {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.25rem;
+    padding: 0.3rem 0.2rem;
+  }
+
+  .ctx-status {
+    border: 1px solid var(--border-soft);
+    background: transparent;
+    color: var(--text-soft);
+    border-radius: 8px;
+    padding: 0.3rem 0.4rem;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+
+  .ctx-status.on,
+  .ctx-status:hover {
+    border-color: var(--accent-2);
+    color: var(--accent-2);
+  }
+
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1500;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
+    backdrop-filter: blur(6px);
+    animation: fade-in 0.15s ease-out;
+  }
+
+  .drop-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 2.2rem 3rem;
+    border-radius: var(--radius-xl);
+    border: 2px dashed var(--accent-2);
+    background: var(--panel-elevated);
+    box-shadow: var(--shadow-float);
+    text-align: center;
+  }
+
+  .drop-icon {
+    font-size: 2.4rem;
+    color: var(--accent-2);
+  }
+
+  .drop-card p {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+  }
+
+  .drop-card small {
+    color: var(--muted);
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
     }
   }
 </style>

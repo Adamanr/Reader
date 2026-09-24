@@ -132,6 +132,8 @@ export interface BookMeta {
   finishedAt?: string | null;
   /** Метаданные файла заполнены автоматически (не перезаписывать ручные). */
   autoMetaDone?: boolean | null;
+  /** Оценка оставшегося времени чтения, минуты (обновляется при чтении). */
+  minutesLeft?: number | null;
   /** Фоновый звук, привязанный к книге. */
   ambientSound?: string | null;
 }
