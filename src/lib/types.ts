@@ -214,6 +214,8 @@ export interface ReaderSelection {
   rect: { left: number; top: number; width: number; height: number };
   /** Привязка для постоянного выделения */
   anchor: Pick<Highlight, "page" | "cfi" | "block" | "offset" | "chapterLabel">;
+  /** Текст абзаца вокруг выделения (для словаря и пояснений) */
+  context?: string;
   clear: () => void;
 }
 

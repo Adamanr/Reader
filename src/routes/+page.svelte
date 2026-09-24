@@ -624,6 +624,10 @@
           <span class="action-label">Добавить</span>
         </button>
       {/if}
+      <a href="/words" class="home-btn home-btn-ghost" title="Слова из книг и повторение">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19l4.5-12h1L14 19M6 14h6M15 11h5M17.5 8.5v5" /></svg>
+        <span class="action-label">Слова</span>
+      </a>
       <a href="/notes" class="home-btn home-btn-ghost" title="Все заметки и выделения">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h9l3 3v13H6z" /><path d="M9 11h6M9 15h4" /></svg>
         <span class="action-label">Заметки</span>

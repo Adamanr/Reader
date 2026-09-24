@@ -395,6 +395,7 @@
     const offset = art ? offsetOfPoint(art, range.startContainer, range.startOffset) : null;
     onSelection?.({
       text,
+      context: startEl?.closest(":is(p, h2, h3, .fb2-v)")?.textContent ?? "",
       rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
       anchor: {
         block: block >= 0 ? block : undefined,
@@ -521,14 +522,22 @@
     while (last + 1 < blocks.length && blocks[last + 1]!.getBoundingClientRect().top < rr.bottom) last++;
     const curSection = blockSection[last] ?? 0;
     const out: TextChunk[] = [];
+    const sectionText = (si: number) =>
+      blocks
+        .filter((_, i) => blockSection[i] === si)
+        .map((b) => (b.textContent ?? "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .join("\n");
     for (let si = 0; si < curSection; si++) {
-      const text = (articles[si]?.textContent ?? "").replace(/\s+/g, " ").trim();
+      const text = sectionText(si);
       if (text.length < 40) continue;
       out.push({ id: `sec-${si}`, label: sections[si]?.title || `Раздел ${si + 1}`, text, partial: false });
     }
     const parts: string[] = [];
-    for (let i = 0; i <= last; i++) if (blockSection[i] === curSection) parts.push(blocks[i]!.textContent ?? "");
-    const text = parts.join(" ").replace(/\s+/g, " ").trim();
+    for (let i = 0; i <= last; i++) {
+      if (blockSection[i] === curSection) parts.push((blocks[i]!.textContent ?? "").replace(/\s+/g, " ").trim());
+    }
+    const text = parts.filter(Boolean).join("\n");
     if (text) out.push({ id: `sec-${curSection}-partial`, label: sections[curSection]?.title || "Текущий раздел", text, partial: true });
     return out;
   }

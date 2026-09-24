@@ -231,8 +231,12 @@
         } catch {
           cfi = "";
         }
+        const node = range.startContainer;
+        const el = (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement) as Element | null;
+        const context = el?.closest("p, li, h1, h2, h3, h4, blockquote, div")?.textContent ?? "";
         onSelection?.({
           text,
+          context,
           rect: { left: fr.left + rect.left, top: fr.top + rect.top, width: rect.width, height: rect.height },
           anchor: { cfi, chapterLabel: chapterForSpine(spineIndexOfHref(currentHref)).label || undefined },
           clear: () => win.getSelection()?.removeAllRanges(),
@@ -421,10 +425,20 @@
     return true;
   }
 
+  /** Текст документа по абзацам — заголовки не слипаются с первой строкой. */
+  function docText(doc: Document, until?: Range): string {
+    const parts: string[] = [];
+    for (const el of blocksOf(doc)) {
+      if (until && until.comparePoint(el, 0) > 0) break;
+      parts.push((el.textContent ?? "").replace(/\s+/g, " ").trim());
+    }
+    return parts.filter(Boolean).join("\n");
+  }
+
   async function sectionText(item: any): Promise<string> {
     try {
       await item.load(book.load.bind(book));
-      const text = (item.document?.body?.textContent ?? "").replace(/\s+/g, " ").trim();
+      const text = item.document?.body ? docText(item.document as Document) : "";
       item.unload();
       return text;
     } catch {
@@ -450,7 +464,7 @@
         const r = doc.createRange();
         r.setStart(doc.body, 0);
         r.setEnd(end.endContainer, end.endOffset);
-        const text = r.toString().replace(/\s+/g, " ").trim();
+        const text = docText(doc, r);
         if (text) out.push({ id: `spine-${idx}-partial`, label: chapterForSpine(idx).label || "Текущая глава", text, partial: true });
       } catch {
         /* ignore */

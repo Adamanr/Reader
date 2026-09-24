@@ -470,8 +470,11 @@
     const layer = pageEl?.querySelector(".textLayer");
     const page = pageEl ? Number(pageEl.dataset.page) : pageNum;
     const offset = layer ? offsetOfPoint(layer, range.startContainer, range.startOffset) : null;
+    const layerText = inTrans ? (transBodyEl?.textContent ?? "") : (layer?.textContent ?? "");
+    const at = inTrans ? layerText.indexOf(text) : (offset ?? 0);
     onSelection?.({
       text,
+      context: layerText.slice(Math.max(0, at - 300), at + text.length + 300),
       rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
       anchor: {
         page,

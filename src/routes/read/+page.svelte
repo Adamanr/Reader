@@ -37,6 +37,9 @@
   import TtsBar from "$lib/components/TtsBar.svelte";
   import RsvpOverlay from "$lib/components/RsvpOverlay.svelte";
   import AmbientPanel from "$lib/components/AmbientPanel.svelte";
+  import LookupPopover from "$lib/components/LookupPopover.svelte";
+  import RecapDialog from "$lib/components/RecapDialog.svelte";
+  import GlossaryPanel from "$lib/components/GlossaryPanel.svelte";
   import { startReading, stopReading, tts } from "$lib/reading/tts.svelte";
   import { AMBIENT_OPTIONS, ambient, playAmbient, stopAmbient, type AmbientId } from "$lib/reading/ambient.svelte";
   import { getBookFormat } from "$lib/bookFormat";
@@ -96,7 +99,7 @@
   let typstJumpLine = $state<number | null>(null);
 
   // ——— Интерфейс ———
-  type PanelTab = "toc" | "notes" | "search" | "translate";
+  type PanelTab = "toc" | "notes" | "search" | "glossary" | "translate";
   const PANEL_KEY = "reader.panelOpen";
   let panelOpen = $state(readPanelPref());
   let panelTab = $state<PanelTab>("toc");
@@ -109,6 +112,14 @@
   let stageEl = $state<HTMLElement | null>(null);
   let isFullscreen = $state(false);
   let rsvpOpen = $state(false);
+  let recapOpen = $state(false);
+  let glossaryVersion = $state(0);
+  let lookup = $state<{
+    kind: "word" | "who";
+    term: string;
+    context: string;
+    rect: { left: number; top: number; width: number; height: number };
+  } | null>(null);
   let ambientOpen = $state(false);
 
   // ——— Выделение и заметки ———
@@ -305,6 +316,17 @@
     if (p === lastOpenedPatchKey) return;
     lastOpenedPatchKey = p;
     const cur = snap.metadata.books[p]!;
+    const prevOpened = cur.lastOpenedAt ? Date.parse(cur.lastOpenedAt) : NaN;
+    const prog = cur.progress ?? (cur.lastReadPdfTotal ? (cur.lastReadPdfPage ?? 0) / cur.lastReadPdfTotal : 0);
+    if (Number.isFinite(prevOpened) && Date.now() - prevOpened > 3 * 86_400_000 && prog > 0.03 && prog < 0.98) {
+      const days = Math.floor((Date.now() - prevOpened) / 86_400_000);
+      setTimeout(() => {
+        toast(`Вы не открывали книгу ${days} дн. Напомнить, что было?`, "info", {
+          action: { label: "Ранее в книге…", run: () => (recapOpen = true) },
+          timeout: 12000,
+        });
+      }, 1800);
+    }
     const patch: Partial<BookMeta> = { lastOpenedAt: new Date().toISOString() };
     if (!cur.status || cur.status === "want") patch.status = "reading";
     untrack(() => patchBook(p, patch));
@@ -499,6 +521,14 @@
     } catch {
       /* ignore */
     }
+    s.clear();
+    selection = null;
+  }
+
+  function lookupSelection(kind: "word" | "who") {
+    const s = selection;
+    if (!s) return;
+    lookup = { kind, term: s.text.trim().slice(0, 80), context: s.context ?? s.text, rect: s.rect };
     s.clear();
     selection = null;
   }
@@ -780,6 +810,8 @@
         break;
       case "Escape":
         if (hlPopover) hlPopover = null;
+        else if (lookup) lookup = null;
+        else if (recapOpen) recapOpen = false;
         else if (ambientOpen) ambientOpen = false;
         else if (aaOpen) aaOpen = false;
         else if (moreOpen) moreOpen = false;
@@ -998,6 +1030,14 @@
                 >
               {/if}
               {#if fmt !== "typst"}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={() => {
+                    moreOpen = false;
+                    recapOpen = true;
+                  }}>Ранее в книге… <kbd>без спойлеров</kbd></button
+                >
                 <button type="button" role="menuitem" onclick={toggleTts}>
                   {tts.active ? "Остановить чтение вслух" : "Читать вслух"} <kbd>S</kbd>
                 </button>
@@ -1045,6 +1085,7 @@
           {#if fmt !== "typst"}
             <button type="button" class:on={panelTab === "notes"} onclick={() => (panelTab = "notes")}>Заметки</button>
             <button type="button" class:on={panelTab === "search"} onclick={() => (panelTab = "search")}>Поиск</button>
+            <button type="button" class:on={panelTab === "glossary"} onclick={() => (panelTab = "glossary")}>Герои</button>
             <button type="button" class:on={panelTab === "translate"} onclick={() => (panelTab = "translate")}>Перевод</button>
           {/if}
           <button type="button" class="side-close" aria-label="Закрыть панель" onclick={() => setPanel(false)}>×</button>
@@ -1113,6 +1154,8 @@
             {/if}
           {:else if panelTab === "search"}
             <ReaderSearchPanel api={navApi} initialQuery={searchSeed} onPicked={finishNavigation} />
+          {:else if panelTab === "glossary"}
+            <GlossaryPanel {bookPath} version={glossaryVersion} progress={position?.progress ?? null} />
           {:else if panelTab === "translate" && fmt !== "typst"}
             <div class="translate-tab">
               <TranslationBar
@@ -1232,7 +1275,7 @@
   {/if}
 
   <ReaderSelectionToolbar
-    visible={!!selection && !hlPopover && !quoteOpen}
+    visible={!!selection && !hlPopover && !quoteOpen && !lookup}
     rect={selection?.rect ?? null}
     short={shortSelection}
     onHighlight={(c) => void addHighlight(c)}
@@ -1240,7 +1283,29 @@
     onQuote={quoteFromSelection}
     onCopy={() => void copySelection()}
     onSearch={searchSelection}
+    onTranslate={() => lookupSelection("word")}
+    onWho={() => lookupSelection("who")}
   />
+
+  {#if lookup && bookPath}
+    <LookupPopover
+      kind={lookup.kind}
+      term={lookup.term}
+      context={lookup.context}
+      rect={lookup.rect}
+      api={navApi}
+      {bookPath}
+      bookTitle={displayTitle}
+      progress={position?.progress ?? null}
+      targetLang={transTarget}
+      onClose={() => (lookup = null)}
+      onGlossaryChanged={() => glossaryVersion++}
+    />
+  {/if}
+
+  {#if recapOpen && navApi && bookPath}
+    <RecapDialog api={navApi} {bookPath} bookTitle={displayTitle} onClose={() => (recapOpen = false)} />
+  {/if}
 
   {#if hlPopover && popHighlight}
     <HighlightPopover
@@ -1528,7 +1593,9 @@
   .side-tabs {
     display: flex;
     align-items: center;
-    gap: 0.15rem;
+    gap: 0.1rem;
+    overflow-x: auto;
+    scrollbar-width: none;
     padding: 0.55rem 0.6rem 0.4rem;
     min-width: var(--side-w);
     box-sizing: border-box;
@@ -1538,7 +1605,7 @@
     border: none;
     background: transparent;
     color: var(--muted);
-    padding: 0.35rem 0.55rem;
+    padding: 0.35rem 0.5rem;
     border-radius: 999px;
     font-size: 0.8rem;
     cursor: pointer;
