@@ -3,6 +3,7 @@
   import SettingsThemeCard from "$lib/components/SettingsThemeCard.svelte";
   import TranslateSettingsCard from "$lib/components/TranslateSettingsCard.svelte";
   import TypstSettingsCard from "$lib/components/TypstSettingsCard.svelte";
+  import ReaderToolsSettingsCard from "$lib/components/ReaderToolsSettingsCard.svelte";
 </script>
 
 <div class="settings-shell">
@@ -16,13 +17,14 @@
       <div class="settings-heading">
         <span class="settings-kicker">Reader</span>
         <h1 class="settings-title">Настройки</h1>
-        <p>Оформление, перевод и экспорт — в одном месте.</p>
+        <p>Оформление, синхронизация, помощник, озвучка, перевод и экспорт.</p>
       </div>
     </div>
   </header>
 
   <main class="settings-main">
     <SettingsThemeCard sectionTitle="Оформление" />
+    <ReaderToolsSettingsCard />
     <TypstSettingsCard />
     <TranslateSettingsCard />
   </main>

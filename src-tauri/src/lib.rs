@@ -1206,6 +1206,150 @@ async fn llm_list_models(base_url: String) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingResponse {
+    data: Vec<OpenAiEmbedding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbedding {
+    embedding: Vec<f32>,
+    #[serde(default)]
+    index: usize,
+}
+
+/// OpenAI-совместимые эмбеддинги (`/embeddings`) — для «созвездия цитат».
+#[tauri::command]
+async fn llm_embeddings(
+    base_url: String,
+    model: String,
+    inputs: Vec<String>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("Укажите URL API".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{base}/embeddings"))
+        .json(&serde_json::json!({ "model": model, "input": inputs }))
+        .send()
+        .await
+        .map_err(|e| format!("Эмбеддинги: {e}"))?;
+    let status = resp.status();
+    let raw = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let short: String = raw.chars().take(400).collect();
+        return Err(format!("Эмбеддинги: HTTP {status} — {short}"));
+    }
+    let mut parsed: OpenAiEmbeddingResponse =
+        serde_json::from_str(&raw).map_err(|e| format!("Эмбеддинги JSON: {e}"))?;
+    parsed.data.sort_by_key(|d| d.index);
+    Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+}
+
+fn command_exists(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Доступные локальные движки озвучки.
+#[tauri::command]
+fn tts_engines() -> Vec<String> {
+    let mut out = Vec::new();
+    if command_exists("piper") {
+        out.push("piper".to_string());
+    }
+    if command_exists("espeak-ng") {
+        out.push("espeak-ng".to_string());
+    }
+    out
+}
+
+/// Озвучка фрагмента локальным движком: WAV в base64.
+/// `voice` — путь к модели `.onnx` для Piper или имя голоса espeak-ng.
+#[tauri::command]
+async fn tts_synthesize(
+    engine: String,
+    text: String,
+    voice: Option<String>,
+    rate: f32,
+) -> Result<String, String> {
+    use std::io::Write;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("Пустой текст".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let tmp = std::env::temp_dir().join(format!(
+            "reader-tts-{}-{}.wav",
+            std::process::id(),
+            now_ms()
+        ));
+        let rate = rate.clamp(0.5, 3.0);
+        let mut cmd = match engine.as_str() {
+            "piper" => {
+                let model = voice
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or("Укажите модель Piper (.onnx) в настройках")?;
+                let mut c = std::process::Command::new("piper");
+                c.arg("--model")
+                    .arg(model.trim())
+                    .arg("--output_file")
+                    .arg(&tmp)
+                    .arg("--length_scale")
+                    .arg(format!("{:.2}", 1.0 / rate));
+                c
+            }
+            "espeak-ng" => {
+                let mut c = std::process::Command::new("espeak-ng");
+                c.arg("-v")
+                    .arg(
+                        voice
+                            .filter(|v| !v.trim().is_empty())
+                            .unwrap_or_else(|| "ru".into()),
+                    )
+                    .arg("-s")
+                    .arg(format!("{}", (175.0 * rate) as u32))
+                    .arg("--stdin")
+                    .arg("-w")
+                    .arg(&tmp);
+                c
+            }
+            _ => return Err("Неизвестный движок озвучки".to_string()),
+        };
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Не удалось запустить {engine}: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{engine}: {}", err.trim()));
+        }
+        let bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&tmp);
+        Ok(STANDARD.encode(bytes))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1239,6 +1383,9 @@ pub fn run() {
             store_write,
             import_books,
             set_sync_in_library,
+            llm_embeddings,
+            tts_engines,
+            tts_synthesize,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

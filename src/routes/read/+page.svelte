@@ -524,6 +524,17 @@
     finishNavigation();
   }
 
+  /** Переход из ленты заметок: `/read?path=…&hl=<id>` */
+  let handledHl = "";
+  $effect(() => {
+    const id = page.url.searchParams.get("hl");
+    const api = navApi;
+    const h = id ? highlights.find((x) => x.id === id) : null;
+    if (!id || !api || !h || handledHl === id) return;
+    handledHl = id;
+    setTimeout(() => void goToHighlight(h), 500);
+  });
+
   const popHighlight = $derived(hlPopover ? (highlights.find((h) => h.id === hlPopover!.id) ?? null) : null);
 
   function addComment(body: string) {
