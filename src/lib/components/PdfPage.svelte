@@ -1,6 +1,7 @@
 <script lang="ts">
   import { AnnotationType, TextLayer } from "pdfjs-dist";
-  import type { PDFDocumentProxy, PDFPageProxy, PageViewport } from "pdfjs-dist";
+  import type { PDFDocumentProxy, PDFPageProxy, PageViewport, RenderTask } from "pdfjs-dist";
+  import { enqueueRender } from "$lib/pdf/renderQueue";
   import type { Highlight } from "$lib/types";
   import { locateText, rangeFromOffsets, unwrapAll, wrapRange } from "$lib/reading/textAnchor";
 
@@ -46,7 +47,12 @@
     onHighlightClick,
   }: Props = $props();
 
-  let canvas = $state<HTMLCanvasElement | null>(null);
+  /** Два холста: рисуем в скрытый, затем меняем местами — без мигания при зуме. */
+  let canvasA = $state<HTMLCanvasElement | null>(null);
+  let canvasB = $state<HTMLCanvasElement | null>(null);
+  let front = $state<0 | 1>(0);
+  let renderTask: RenderTask | null = null;
+  let fontRetryDone = false;
   let textLayerEl = $state<HTMLDivElement | null>(null);
   let linkLayerEl = $state<HTMLDivElement | null>(null);
   let textLayer: InstanceType<typeof TextLayer> | null = null;
@@ -111,22 +117,41 @@
     }
   }
 
+  /** Растровый (CPU) контекст: GPU-холсты WebKitGTK на некоторых драйверах теряют глифы. */
+  function ctxOf(c: HTMLCanvasElement): CanvasRenderingContext2D | null {
+    return c.getContext("2d", { alpha: false, willReadFrequently: true });
+  }
+
+  function clearCanvas(c: HTMLCanvasElement | null) {
+    if (!c) return;
+    c.width = 0;
+    c.height = 0;
+  }
+
   function release() {
     token++;
+    renderTask?.cancel();
+    renderTask = null;
     textLayer?.cancel();
     textLayer = null;
     textReady = false;
     renderedKey = "";
-    if (canvas) {
-      canvas.width = 0;
-      canvas.height = 0;
-    }
+    clearCanvas(canvasA);
+    clearCanvas(canvasB);
     if (textLayerEl) textLayerEl.innerHTML = "";
     if (linkLayerEl) linkLayerEl.innerHTML = "";
   }
 
+  /** Плотность пикселей с ограничением размера холста (лимиты памяти/текстур). */
+  function pixelRatio(viewport: PageViewport): number {
+    const want = Math.min(window.devicePixelRatio || 1, 3);
+    const MAX_PIXELS = 16_000_000;
+    const area = viewport.width * viewport.height;
+    return Math.max(0.5, Math.min(want, Math.sqrt(MAX_PIXELS / Math.max(1, area))));
+  }
+
   async function render() {
-    if (!canvas || !textLayerEl || !linkLayerEl) return;
+    if (!canvasA || !canvasB || !textLayerEl || !linkLayerEl) return;
     const key = `${scale.toFixed(4)}|${inlineShow}|${inlineSpans?.length ?? 0}`;
     if (key === renderedKey) return;
     const my = ++token;
@@ -137,31 +162,40 @@
       onBase?.(n, vp1.width, vp1.height);
     }
     const viewport = page.getViewport({ scale });
-    // Резкость на HiDPI: холст в физических пикселях, CSS — в логических.
-    const dpr = Math.min(window.devicePixelRatio || 1, 3);
-    const off = document.createElement("canvas");
-    off.width = Math.floor(viewport.width * dpr);
-    off.height = Math.floor(viewport.height * dpr);
-    const ctx = off.getContext("2d");
-    if (!ctx) return;
-    try {
-      await page.render({
-        canvas: off,
+    const fontsWereLoading = document.fonts?.status === "loading";
+
+    // Холст должен быть в документе (а не отдельным offscreen): так шрифты
+    // PDF гарантированно доступны при рисовании текста.
+    const back = front === 0 ? canvasB : canvasA;
+    const shown = front === 0 ? canvasA : canvasB;
+    const ok = await enqueueRender(doc, async () => {
+      if (my !== token) return false;
+      const dpr = pixelRatio(viewport);
+      back.width = Math.floor(viewport.width * dpr);
+      back.height = Math.floor(viewport.height * dpr);
+      const ctx = ctxOf(back);
+      if (!ctx) return false;
+      renderTask = page.render({
+        canvas: back,
         canvasContext: ctx,
         viewport,
         transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
         background: "#ffffff",
         intent: "any",
         optionalContentConfigPromise: doc.getOptionalContentConfig({ intent: "any" }),
-      }).promise;
-    } catch {
-      return;
-    }
-    if (my !== token || !canvas) return;
-    // Переносим готовый кадр одним движением — без мигания белым при зуме.
-    canvas.width = off.width;
-    canvas.height = off.height;
-    canvas.getContext("2d")?.drawImage(off, 0, 0);
+      });
+      try {
+        await renderTask.promise;
+        return true;
+      } catch {
+        return false;
+      } finally {
+        renderTask = null;
+      }
+    });
+    if (!ok || my !== token) return;
+    front = front === 0 ? 1 : 0;
+    clearCanvas(shown);
 
     textLayer?.cancel();
     textLayerEl.innerHTML = "";
@@ -193,6 +227,16 @@
     if (my !== token) return;
     renderedKey = key;
     textReady = true;
+
+    // Если шрифты ещё грузились — перерисуем один раз, когда загрузятся.
+    if (fontsWereLoading && !fontRetryDone && document.fonts) {
+      fontRetryDone = true;
+      void document.fonts.ready.then(() => {
+        if (my !== token || !active) return;
+        renderedKey = "";
+        void render();
+      });
+    }
   }
 
   $effect(() => {
@@ -276,9 +320,18 @@
     style:--scale-factor={scale}
   >
     <canvas
-      bind:this={canvas}
+      bind:this={canvasA}
       class="pdf-canvas"
       class:inverted={invert}
+      class:hidden={front !== 0}
+      style:width="{fullW}px"
+      style:height="{fullH}px"
+    ></canvas>
+    <canvas
+      bind:this={canvasB}
+      class="pdf-canvas"
+      class:inverted={invert}
+      class:hidden={front !== 1}
       style:width="{fullW}px"
       style:height="{fullH}px"
     ></canvas>
@@ -298,7 +351,6 @@
     background: #fff;
     box-shadow: var(--shadow-book);
     border-radius: 3px;
-    content-visibility: auto;
   }
 
   .pdf-page-inner {
@@ -311,6 +363,10 @@
     display: block;
     position: absolute;
     inset: 0;
+  }
+
+  .pdf-canvas.hidden {
+    visibility: hidden;
   }
 
   .pdf-canvas.inverted {

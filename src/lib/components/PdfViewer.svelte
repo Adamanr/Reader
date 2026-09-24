@@ -19,6 +19,7 @@
   import { extractReadablePageText, splitForTranslation } from "$lib/pdf/readablePageText";
   import { translateStringList } from "$lib/translate/translateApi";
   import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
+  import { enqueueRender } from "$lib/pdf/renderQueue";
   import { reading, updateReading } from "$lib/reading/settings.svelte";
   import type { PagePalette } from "$lib/reading/palette";
   import { excerptAround, findAll, offsetOfPoint } from "$lib/reading/textAnchor";
@@ -171,7 +172,7 @@
       c.height = Math.ceil(vp.height);
       const ctx = c.getContext("2d", { willReadFrequently: true });
       if (!ctx) continue;
-      await page.render({ canvas: c, canvasContext: ctx, viewport: vp, background: "#ffffff" }).promise;
+      await enqueueRender(doc, () => page.render({ canvas: c, canvasContext: ctx, viewport: vp, background: "#ffffff" }).promise);
       const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height);
       for (let y = 0; y < height; y += 2) {
         for (let x = 0; x < width; x += 2) {
