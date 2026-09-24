@@ -3,9 +3,9 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
-  import type { BookMeta, Importance, LibraryMetadata, LibrarySnapshot, ReadingStatus, Shelf } from "$lib/types";
-  import { IMPORTANCE_OPTIONS, READING_STATUS_OPTIONS } from "$lib/types";
-  import { formatBadgeLabel, getBookFormat } from "$lib/bookFormat";
+  import type { BookMeta, LibraryMetadata, LibrarySnapshot, ReadingStatus, Shelf } from "$lib/types";
+  import { READING_STATUS_OPTIONS } from "$lib/types";
+  import { getBookFormat } from "$lib/bookFormat";
   import { bookOnShelf, effectiveShelfIds } from "$lib/library/shelves";
   import {
     fetchLibrarySnapshot,
@@ -22,64 +22,53 @@
     writeLibraryView,
     type LibraryViewMode,
   } from "$lib/library/libraryListPrefs";
-  import ContinueReading from "$lib/components/ContinueReading.svelte";
-  import SpineShelf from "$lib/components/SpineShelf.svelte";
-  import RhythmCard from "$lib/components/RhythmCard.svelte";
   import {
     STATUS_LABELS,
     bookProgress,
+    bookTitle,
     dustLabel,
-    dustLevel,
     effectiveStatus,
     pluralBooks,
+    titleFromPath,
     type ShelfStatus,
   } from "$lib/library/bookInfo";
-  import SettingsThemeCard from "$lib/components/SettingsThemeCard.svelte";
+  import HomeSidebar from "$lib/components/home/HomeSidebar.svelte";
+  import HomeHero from "$lib/components/home/HomeHero.svelte";
+  import Book3D from "$lib/components/home/Book3D.svelte";
+  import BookEditDialog from "$lib/components/home/BookEditDialog.svelte";
+  import SpineShelf from "$lib/components/SpineShelf.svelte";
   import BookFullTranslateModal from "$lib/components/BookFullTranslateModal.svelte";
-  import BookCoverThumb from "$lib/components/BookCoverThumb.svelte";
   import DreamSelect from "$lib/components/DreamSelect.svelte";
   import { isTauriRuntime } from "$lib/isTauri";
   import { exportBookToTypst } from "$lib/typst/exportToTypst";
   import { toast, toastError } from "$lib/ui/toast.svelte";
+  import type { CoverTone } from "$lib/reading/palette";
 
   let snapshot = $state<LibrarySnapshot | null>(getCachedLibrarySnapshot());
   let shelfFilter = $state<string>("all");
-  let newShelfName = $state("");
   let banner = $state<string | null>(null);
   let searchQuery = $state("");
   let statusFilter = $state<ShelfStatus | "all">("all");
   let viewMode = $state<LibraryViewMode>("grid");
+  let librarySort = $state<LibrarySortMode>(DEFAULT_LIBRARY_SORT);
   let dragActive = $state(false);
-  let mobileLibraryOpen = $state(false);
+  let menuOpen = $state(false);
+  let searchEl = $state<HTMLInputElement | null>(null);
+  let tone = $state<CoverTone | null>(null);
+  let scrolled = $state(false);
 
   let ctxMenu = $state<{ x: number; y: number; path: string } | null>(null);
   let bookAction = $state<{ kind: "hide" | "delete"; path: string } | null>(null);
   let bookActionBusy = $state(false);
   let bookActionError = $state<string | null>(null);
   let editPath = $state<string | null>(null);
-  const editOpen = $derived(editPath != null);
-  let editDraft = $state<{
-    title: string;
-    author: string;
-    typstStyleRelativePath: string;
-    importance: Importance;
-    status: ReadingStatus | "";
-    shelfIds: string[];
-    review: string;
-  } | null>(null);
-
   let fullTranslateBook = $state<string | null>(null);
+
   const pendingMetaPatches = new Map<string, Partial<BookMeta>>();
   let metaPatchTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const IMPORTANCE_ORDER: Record<string, number> = {
-    essential: 0,
-    high: 1,
-    normal: 2,
-    low: 3,
-  };
-
-  let librarySort = $state<LibrarySortMode>(DEFAULT_LIBRARY_SORT);
+  const IMPORTANCE_ORDER: Record<string, number> = { essential: 0, high: 1, normal: 2, low: 3 };
+  const STATUS_FILTERS: (ShelfStatus | "all")[] = ["all", "reading", "new", "want", "done", "dropped"];
 
   onMount(() => {
     librarySort = readLibrarySort();
@@ -97,112 +86,174 @@
   }
 
   function openedAtTs(meta: BookMeta | undefined): number {
-    const s = meta?.lastOpenedAt;
-    if (!s) return 0;
-    const t = Date.parse(s);
+    const t = meta?.lastOpenedAt ? Date.parse(meta.lastOpenedAt) : 0;
     return Number.isFinite(t) ? t : 0;
   }
 
   function cmpBookPaths(a: string, b: string): number {
     const ma = snapshot!.metadata.books[a];
     const mb = snapshot!.metadata.books[b];
+    const ta = bookTitle(a, ma).toLowerCase();
+    const tb = bookTitle(b, mb).toLowerCase();
     switch (librarySort) {
       case "recent": {
-        const ta = openedAtTs(ma);
-        const tb = openedAtTs(mb);
-        if (tb !== ta) return tb - ta;
+        const d = openedAtTs(mb) - openedAtTs(ma);
+        if (d) return d;
         break;
       }
-      case "title": {
-        const xa = (ma?.title?.trim() || titleFromPath(a)).toLowerCase();
-        const xb = (mb?.title?.trim() || titleFromPath(b)).toLowerCase();
-        return xa.localeCompare(xb, "ru");
-      }
-      case "title_desc": {
-        const xa = (ma?.title?.trim() || titleFromPath(a)).toLowerCase();
-        const xb = (mb?.title?.trim() || titleFromPath(b)).toLowerCase();
-        return xb.localeCompare(xa, "ru");
-      }
+      case "title":
+        return ta.localeCompare(tb, "ru");
+      case "title_desc":
+        return tb.localeCompare(ta, "ru");
       case "added": {
-        const ta = ma?.addedAtMs ?? 0;
-        const tb = mb?.addedAtMs ?? 0;
-        if (tb !== ta) return tb - ta;
+        const d = (mb?.addedAtMs ?? 0) - (ma?.addedAtMs ?? 0);
+        if (d) return d;
         break;
       }
       case "progress": {
-        const pa = bookProgress(ma) ?? -1;
-        const pb = bookProgress(mb) ?? -1;
-        if (pb !== pa) return pb - pa;
+        const d = (bookProgress(mb) ?? -1) - (bookProgress(ma) ?? -1);
+        if (d) return d;
         break;
       }
       case "importance": {
-        const ia = IMPORTANCE_ORDER[String(ma?.importance ?? "normal")] ?? 2;
-        const ib = IMPORTANCE_ORDER[String(mb?.importance ?? "normal")] ?? 2;
-        if (ia !== ib) return ia - ib;
+        const d =
+          (IMPORTANCE_ORDER[String(ma?.importance ?? "normal")] ?? 2) -
+          (IMPORTANCE_ORDER[String(mb?.importance ?? "normal")] ?? 2);
+        if (d) return d;
         break;
       }
-      default:
-        break;
     }
-    const xa = (ma?.title?.trim() || titleFromPath(a)).toLowerCase();
-    const xb = (mb?.title?.trim() || titleFromPath(b)).toLowerCase();
-    return xa.localeCompare(xb, "ru");
+    return ta.localeCompare(tb, "ru");
   }
 
-  const shelvesSorted = $derived(
-    snapshot ? [...snapshot.metadata.shelves].sort((a, b) => a.order - b.order) : [],
-  );
+  const shelvesSorted = $derived(snapshot ? [...snapshot.metadata.shelves].sort((a, b) => a.order - b.order) : []);
+
+  const shelfPaths = $derived.by(() => {
+    if (!snapshot) return [];
+    if (shelfFilter === "hidden") return snapshot.hiddenBookPaths;
+    if (shelfFilter === "all") return snapshot.bookPaths;
+    return snapshot.bookPaths.filter((p) => bookOnShelf(snapshot!.metadata.books[p], shelfFilter));
+  });
 
   const displayedBooks = $derived.by(() => {
     if (!snapshot) return [];
-    let paths = shelfFilter === "hidden" ? snapshot.hiddenBookPaths : snapshot.bookPaths;
-    if (shelfFilter !== "all" && shelfFilter !== "hidden") {
-      paths = paths.filter((p) =>
-        bookOnShelf(snapshot!.metadata.books[p], shelfFilter),
-      );
-    }
-    if (statusFilter !== "all") {
-      paths = paths.filter((p) => effectiveStatus(snapshot!.metadata.books[p]) === statusFilter);
-    }
+    let paths = shelfPaths;
+    if (statusFilter !== "all") paths = paths.filter((p) => effectiveStatus(snapshot!.metadata.books[p]) === statusFilter);
     const query = searchQuery.trim().toLocaleLowerCase("ru");
     if (query) {
       paths = paths.filter((p) => {
         const meta = snapshot!.metadata.books[p];
-        const haystack = [titleFromPath(p), meta?.title, meta?.author]
+        return [titleFromPath(p), meta?.title, meta?.author]
           .filter(Boolean)
           .join(" ")
-          .toLocaleLowerCase("ru");
-        return haystack.includes(query);
+          .toLocaleLowerCase("ru")
+          .includes(query);
       });
     }
     return paths.slice().sort(cmpBookPaths);
   });
 
-  /** Книги «в процессе» для блока «Продолжить чтение». */
   const continueBooks = $derived.by(() => {
     if (!snapshot) return [];
     return snapshot.bookPaths
       .map((path) => ({ path, meta: snapshot!.metadata.books[path]! }))
       .filter((b) => b.meta?.lastOpenedAt && effectiveStatus(b.meta) === "reading")
       .sort((a, b) => Date.parse(b.meta.lastOpenedAt!) - Date.parse(a.meta.lastOpenedAt!))
-      .slice(0, 4);
+      .slice(0, 5);
   });
+
+  const showHero = $derived(shelfFilter === "all" && statusFilter === "all" && !searchQuery.trim());
 
   const statusCounts = $derived.by(() => {
     const c: Record<string, number> = {};
-    if (!snapshot) return c;
-    const base =
-      shelfFilter === "all" || shelfFilter === "hidden"
-        ? snapshot.bookPaths
-        : snapshot.bookPaths.filter((p) => bookOnShelf(snapshot!.metadata.books[p], shelfFilter));
-    for (const p of base) {
+    if (!snapshot || shelfFilter === "hidden") return c;
+    for (const p of shelfPaths) {
       const st = effectiveStatus(snapshot.metadata.books[p]);
       c[st] = (c[st] ?? 0) + 1;
     }
     return c;
   });
 
-  const STATUS_FILTERS: (ShelfStatus | "all")[] = ["all", "reading", "new", "want", "done", "dropped"];
+  const heading = $derived(
+    searchQuery.trim()
+      ? "Поиск"
+      : shelfFilter === "all"
+        ? "Вся библиотека"
+        : shelfFilter === "hidden"
+          ? "Скрытые книги"
+          : (shelvesSorted.find((s) => s.id === shelfFilter)?.name ?? "Полка"),
+  );
+
+  function countForShelf(shelfId: string): number {
+    const snap = snapshot;
+    if (!snap) return 0;
+    if (shelfId === "all") return snap.bookPaths.length;
+    if (shelfId === "hidden") return snap.hiddenBookPaths.length;
+    return snap.bookPaths.filter((p) => bookOnShelf(snap.metadata.books[p], shelfId)).length;
+  }
+
+  function bookIsHidden(path: string): boolean {
+    return snapshot?.hiddenBookPaths.includes(path) ?? false;
+  }
+
+  // ——— Данные ———
+  async function refresh() {
+    try {
+      banner = null;
+      snapshot = await fetchLibrarySnapshot();
+    } catch (e) {
+      banner = String(e);
+    }
+  }
+
+  async function pickFolder() {
+    const dir = await open({ directory: true, multiple: false });
+    if (typeof dir !== "string") return;
+    try {
+      await invoke("set_library_root", { path: dir });
+      await refresh();
+    } catch (e) {
+      banner = String(e);
+    }
+  }
+
+  async function persist(next: LibraryMetadata) {
+    await invoke("save_library_metadata", { metadata: next });
+    setCachedLibraryMetadata(next);
+    if (snapshot) snapshot = { ...snapshot, metadata: next };
+  }
+
+  function patchBook(path: string, patch: Partial<BookMeta>) {
+    if (!snapshot) return;
+    const cur = snapshot.metadata.books[path];
+    if (!cur) return;
+    const books = { ...snapshot.metadata.books, [path]: { ...cur, ...patch } };
+    void persist({ ...snapshot.metadata, books }).catch((e) => toastError(e, "Сохранение"));
+  }
+
+  /** Название и автор из файла книги — только если пользователь их не задавал. */
+  function applyDiscoveredMeta(path: string, m: { title: string | null; author: string | null }) {
+    const cur = snapshot?.metadata.books[path];
+    if (!cur || cur.autoMetaDone) return;
+    const patch: Partial<BookMeta> = { autoMetaDone: true };
+    if (!cur.title?.trim() && m.title) patch.title = m.title;
+    if (!cur.author?.trim() && m.author) patch.author = m.author;
+    pendingMetaPatches.set(path, patch);
+    if (metaPatchTimer) clearTimeout(metaPatchTimer);
+    metaPatchTimer = setTimeout(flushMetaPatches, 700);
+  }
+
+  function flushMetaPatches() {
+    metaPatchTimer = null;
+    if (!snapshot || pendingMetaPatches.size === 0) return;
+    const books = { ...snapshot.metadata.books };
+    for (const [path, patch] of pendingMetaPatches) {
+      const current = books[path];
+      if (current) books[path] = { ...current, ...patch };
+    }
+    pendingMetaPatches.clear();
+    void persist({ ...snapshot.metadata, books }).catch(() => {});
+  }
 
   function setBookStatus(path: string, status: ReadingStatus) {
     const patch: Partial<BookMeta> = { status };
@@ -210,7 +261,35 @@
     patchBook(path, patch);
   }
 
-  // ——— Импорт книг: кнопка и перетаскивание файлов в окно ———
+  // ——— Полки ———
+  async function addShelf(name: string) {
+    if (!snapshot) return;
+    const order = snapshot.metadata.shelves.reduce((m, s) => Math.max(m, s.order), -1) + 1;
+    const shelves: Shelf[] = [...snapshot.metadata.shelves, { id: crypto.randomUUID(), name, order }];
+    await persist({ ...snapshot.metadata, shelves });
+  }
+
+  async function removeShelf(shelfId: string) {
+    if (!snapshot || shelfId === "default") return;
+    const shelves = snapshot.metadata.shelves.filter((s) => s.id !== shelfId);
+    const books = { ...snapshot.metadata.books };
+    for (const k of Object.keys(books)) {
+      const b = books[k]!;
+      let ids = effectiveShelfIds(b).filter((id) => id !== shelfId);
+      if (ids.length === 0) ids = ["default"];
+      books[k] = { ...b, shelfIds: ids, shelfId: ids[0] ?? "default" };
+    }
+    if (shelfFilter === shelfId) shelfFilter = "all";
+    await persist({ ...snapshot.metadata, shelves, books });
+  }
+
+  function selectShelf(id: string) {
+    shelfFilter = id;
+    statusFilter = "all";
+    menuOpen = false;
+  }
+
+  // ——— Импорт: кнопка и перетаскивание файлов в окно ———
   async function importPaths(paths: string[]) {
     if (!paths.length) return;
     if (!snapshot?.libraryRoot) {
@@ -228,10 +307,7 @@
   }
 
   async function pickBooks() {
-    const picked = await open({
-      multiple: true,
-      filters: [{ name: "Книги", extensions: ["pdf", "epub", "fb2"] }],
-    });
+    const picked = await open({ multiple: true, filters: [{ name: "Книги", extensions: ["pdf", "epub", "fb2"] }] });
     if (!picked) return;
     await importPaths(Array.isArray(picked) ? picked : [picked]);
   }
@@ -259,166 +335,24 @@
     };
   });
 
-  function selectShelf(id: string) {
-    shelfFilter = id;
-    mobileLibraryOpen = false;
-  }
-
-  const editMeta = $derived(
-    editPath && snapshot ? snapshot.metadata.books[editPath] ?? null : null,
-  );
-
-  function titleFromPath(path: string) {
-    const i = path.lastIndexOf("/");
-    return i >= 0 ? path.slice(i + 1) : path;
-  }
-
-  function countForShelf(shelfId: string): number {
-    const snap = snapshot;
-    if (!snap) return 0;
-    if (shelfId === "all") return snap.bookPaths.length;
-    if (shelfId === "hidden") return snap.hiddenBookPaths.length;
-    return snap.bookPaths.filter((p) => bookOnShelf(snap.metadata.books[p], shelfId)).length;
-  }
-
-  const stageHeading = $derived(
-    shelfFilter === "all"
-      ? "Все книги"
-      : shelfFilter === "hidden"
-        ? "Скрытые книги"
-        : (shelvesSorted.find((s) => s.id === shelfFilter)?.name ?? "Полка"),
-  );
-
-  function bookIsHidden(path: string): boolean {
-    return snapshot?.hiddenBookPaths.includes(path) ?? false;
-  }
-
-  function importanceLabel(v: string) {
-    return IMPORTANCE_OPTIONS.find((o) => o.value === v)?.label ?? v;
-  }
-
-  function readingProgress(
-    meta: BookMeta | undefined,
-    fmt: NonNullable<ReturnType<typeof getBookFormat>>,
-  ): { pct: number | null; label: string } | null {
-    if (!meta) return null;
-    const p = bookProgress(meta);
-    const chapter = meta.lastReadLocationLabel?.trim() ?? "";
-    if (p == null && !chapter) return null;
-    const pct = p != null ? Math.round(p * 100) : null;
-    const parts: string[] = [];
-    if (pct != null) parts.push(`${pct}%`);
-    if (fmt === "pdf" && meta.lastReadPdfPage && meta.lastReadPdfTotal) {
-      parts.push(`стр. ${meta.lastReadPdfPage} / ${meta.lastReadPdfTotal}`);
-    } else if (chapter) parts.push(chapter);
-    return { pct, label: parts.join(" · ") };
-  }
-
-  async function exportBookToTypstFromMenu() {
-    if (!ctxMenu || !snapshot) return;
-    const path = ctxMenu.path;
-    const fmt = getBookFormat(path);
-    if (!fmt || fmt === "typst") return;
-    const style = snapshot.metadata.books[path]?.typstStyleRelativePath;
-    closeCtx();
-    try {
-      const { mainRelativePath } = await exportBookToTypst(
-        path,
-        fmt,
-        snapshot,
-        style,
-      );
-      await refresh();
-      await goto("/read?path=" + encodeURIComponent(mainRelativePath));
-    } catch (e) {
-      toastError(e, "Экспорт в Typst");
-    }
-  }
-
-  async function refresh() {
-    try {
-      banner = null;
-      snapshot = await fetchLibrarySnapshot();
-    } catch (e) {
-      banner = String(e);
-    }
-  }
-
-  async function pickFolder() {
-    const dir = await open({ directory: true, multiple: false });
-    if (typeof dir !== "string") return;
-    try {
-      await invoke("set_library_root", { path: dir });
-      await refresh();
-    } catch (e) {
-      banner = String(e);
-    }
-  }
-
-  async function persist(next: LibraryMetadata) {
-    await invoke("save_library_metadata", { metadata: next });
-    setCachedLibraryMetadata(next);
-    if (snapshot) {
-      snapshot = { ...snapshot, metadata: next };
-    }
-  }
-
-  /** Название и автор из файла книги — только если пользователь их не задавал. */
-  function applyDiscoveredMeta(path: string, m: { title: string | null; author: string | null }) {
-    const cur = snapshot?.metadata.books[path];
-    if (!cur || cur.autoMetaDone) return;
-    const patch: Partial<BookMeta> = { autoMetaDone: true };
-    if (!cur.title?.trim() && m.title) patch.title = m.title;
-    if (!cur.author?.trim() && m.author) patch.author = m.author;
-    pendingMetaPatches.set(path, patch);
-    if (metaPatchTimer) clearTimeout(metaPatchTimer);
-    metaPatchTimer = setTimeout(flushMetaPatches, 700);
-  }
-
-  function flushMetaPatches() {
-    metaPatchTimer = null;
-    if (!snapshot || pendingMetaPatches.size === 0) return;
-    const books = { ...snapshot.metadata.books };
-    for (const [path, patch] of pendingMetaPatches) {
-      const current = books[path];
-      if (current) books[path] = { ...current, ...patch };
-    }
-    pendingMetaPatches.clear();
-    void persist({ ...snapshot.metadata, books }).catch(() => {});
-  }
-
-  function patchBook(path: string, patch: Partial<BookMeta>) {
-    if (!snapshot) return;
-    const cur = snapshot.metadata.books[path];
-    if (!cur) return;
-    const books = { ...snapshot.metadata.books, [path]: { ...cur, ...patch } };
-    void persist({ ...snapshot.metadata, books });
-  }
-
-  function toggleBookShelf(shelfId: string) {
-    if (!editDraft) return;
-    let ids = [...editDraft.shelfIds];
-    if (ids.includes(shelfId)) {
-      ids = ids.filter((id) => id !== shelfId);
-      if (ids.length === 0) ids = ["default"];
-    } else {
-      ids.push(shelfId);
-    }
-    editDraft = { ...editDraft, shelfIds: ids };
-  }
-
+  // ——— Действия с книгой ———
   function openBook(p: string) {
     if (!getBookFormat(p)) return;
-    goto("/read?path=" + encodeURIComponent(p));
+    void goto("/read?path=" + encodeURIComponent(p));
   }
 
-  function onCardContextMenu(e: MouseEvent, p: string) {
+  function onCardClick(e: MouseEvent, p: string) {
+    if (bookIsHidden(p)) openMenu(e, p);
+    else openBook(p);
+  }
+
+  function openMenu(e: MouseEvent, p: string) {
     e.preventDefault();
-    const menuWidth = 224;
-    const menuHeight = 380;
+    const w = 240;
+    const h = 420;
     ctxMenu = {
-      x: Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 12)),
-      y: Math.max(12, Math.min(e.clientY, window.innerHeight - menuHeight - 12)),
+      x: Math.max(12, Math.min(e.clientX, window.innerWidth - w - 12)),
+      y: Math.max(12, Math.min(e.clientY, window.innerHeight - h - 12)),
       path: p,
     };
   }
@@ -455,8 +389,9 @@
     closeCtx();
     try {
       await setBookHidden(path, false);
-    } catch {
-      banner = "Не удалось вернуть книгу в библиотеку. Попробуйте ещё раз.";
+      toast("Книга снова на полке", "success");
+    } catch (e) {
+      toastError(e, "Не удалось вернуть книгу");
     }
   }
 
@@ -466,9 +401,8 @@
     bookActionBusy = true;
     bookActionError = null;
     try {
-      if (kind === "hide") {
-        await setBookHidden(path, true);
-      } else {
+      if (kind === "hide") await setBookHidden(path, true);
+      else {
         await invoke("delete_library_book", { relativePath: path });
         await refresh();
       }
@@ -483,79 +417,64 @@
     }
   }
 
-  function startEdit() {
-    if (ctxMenu) {
-      editPath = ctxMenu.path;
-      const m = snapshot?.metadata.books[ctxMenu.path];
-      if (m) {
-        editDraft = {
-          title: m.title ?? "",
-          author: m.author ?? "",
-          typstStyleRelativePath: m.typstStyleRelativePath ?? "",
-          importance: (IMPORTANCE_OPTIONS.some((o) => o.value === m.importance)
-            ? m.importance
-            : "normal") as Importance,
-          status: m.status ?? "",
-          shelfIds: [...effectiveShelfIds(m)],
-          review: m.review ?? "",
-        };
+  async function exportBookToTypstFromMenu() {
+    if (!ctxMenu || !snapshot) return;
+    const path = ctxMenu.path;
+    const fmt = getBookFormat(path);
+    if (!fmt || fmt === "typst") return;
+    const style = snapshot.metadata.books[path]?.typstStyleRelativePath;
+    closeCtx();
+    try {
+      const { mainRelativePath } = await exportBookToTypst(path, fmt, snapshot, style);
+      await refresh();
+      await goto("/read?path=" + encodeURIComponent(mainRelativePath));
+    } catch (e) {
+      toastError(e, "Экспорт в Typst");
+    }
+  }
+
+  function progressLabel(meta: BookMeta | undefined): string {
+    const st = effectiveStatus(meta);
+    if (st === "done") return "Прочитано";
+    const p = bookProgress(meta);
+    if (st === "reading" && p != null) return `${Math.round(p * 100)}%`;
+    return STATUS_LABELS[st];
+  }
+
+  // ——— Клавиатура ———
+  function onKey(e: KeyboardEvent) {
+    const typing = (e.target as HTMLElement)?.closest?.("input, textarea, select");
+    if (e.key === "Escape") {
+      if (ctxMenu) closeCtx();
+      else if (menuOpen) menuOpen = false;
+      else if (typing && searchQuery) searchQuery = "";
+      return;
+    }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchEl?.focus();
       }
-      closeCtx();
+      return;
     }
-  }
-
-  function closeEdit() {
-    editPath = null;
-    editDraft = null;
-  }
-
-  function saveEdit() {
-    if (!editPath || !editDraft) return;
-    const shelfIds = editDraft.shelfIds.length ? editDraft.shelfIds : ["default"];
-    patchBook(editPath, {
-      title: editDraft.title.trim() || null,
-      author: editDraft.author.trim() || null,
-      typstStyleRelativePath: editDraft.typstStyleRelativePath.trim() || null,
-      importance: editDraft.importance,
-      status: editDraft.status || null,
-      shelfIds,
-      shelfId: shelfIds[0] ?? "default",
-      review: editDraft.review,
-    });
-    closeEdit();
-  }
-
-  async function addShelf() {
-    const name = newShelfName.trim();
-    if (!name || !snapshot) return;
-    const id = crypto.randomUUID();
-    const order =
-      snapshot.metadata.shelves.reduce((m, s) => Math.max(m, s.order), -1) + 1;
-    const shelves: Shelf[] = [...snapshot.metadata.shelves, { id, name, order }];
-    newShelfName = "";
-    await persist({ ...snapshot.metadata, shelves });
-  }
-
-  async function removeShelf(shelfId: string) {
-    if (!snapshot || shelfId === "default") return;
-    const shelves = snapshot.metadata.shelves.filter((s) => s.id !== shelfId);
-    const books = { ...snapshot.metadata.books };
-    for (const k of Object.keys(books)) {
-      const b = books[k]!;
-      let ids = effectiveShelfIds(b).filter((id) => id !== shelfId);
-      if (ids.length === 0) ids = ["default"];
-      books[k] = {
-        ...b,
-        shelfIds: ids,
-        shelfId: ids[0] ?? "default",
-      };
+    if (e.key === "/") {
+      e.preventDefault();
+      searchEl?.focus();
     }
-    if (shelfFilter === shelfId) shelfFilter = "all";
-    await persist({ shelves, books });
   }
 
   $effect(() => {
     if (!snapshot) void refresh();
+  });
+
+  $effect(() => {
+    if (!ctxMenu) return;
+    const onDown = (e: PointerEvent) => {
+      const el = document.getElementById("ctx-menu");
+      if (el && !el.contains(e.target as Node)) closeCtx();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
   });
 
   onDestroy(() => {
@@ -563,257 +482,113 @@
     flushMetaPatches();
   });
 
-  $effect(() => {
-    if (!ctxMenu) return;
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node;
-      const el = document.getElementById("ctx-menu");
-      if (el && !el.contains(t)) closeCtx();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        closeCtx();
-        mobileLibraryOpen = false;
-        closeEdit();
-        closeBookAction();
-      }
-    };
-    document.addEventListener("pointerdown", onDown, true);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("pointerdown", onDown, true);
-      document.removeEventListener("keydown", onKey);
-    };
-  });
+  const glow = $derived(
+    tone ? `hsl(${tone.h} ${Math.max(30, Math.min(tone.s, 60))}% 62% / 0.22)` : "color-mix(in srgb, var(--accent) 16%, transparent)",
+  );
+  const editMeta = $derived(editPath && snapshot ? (snapshot.metadata.books[editPath] ?? null) : null);
 </script>
 
-<div class="home">
-  {#if dragActive}
-    <div class="drop-overlay" aria-hidden="true">
-      <div class="drop-card">
-        <span class="drop-icon">⤓</span>
-        <p>Отпустите, чтобы добавить книги в библиотеку</p>
-        <small>PDF, EPUB, FB2 — файлы скопируются в папку библиотеки</small>
-      </div>
-    </div>
-  {/if}
-  <div class="home-ambient" aria-hidden="true"></div>
-  <div class="home-film" aria-hidden="true"></div>
+<svelte:window onkeydown={onKey} onscroll={() => (scrolled = window.scrollY > 8)} />
 
-  <header class="home-top">
-    <div class="home-brand">
-      <span class="home-mark" aria-hidden="true"></span>
-      <div class="home-brand-text">
-        <span class="home-logo">Reader</span>
-        <span class="home-tagline">пространство для чтения</span>
-      </div>
-    </div>
-    <div class="home-actions">
-      <button
-        type="button"
-        class="home-btn home-btn-ghost home-shelves-toggle"
-        aria-expanded={mobileLibraryOpen}
-        onclick={() => (mobileLibraryOpen = !mobileLibraryOpen)}
-      >
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h16" /></svg>
-        Полки
+<div class="app" style:--glow={glow}>
+  <HomeSidebar
+    shelves={shelvesSorted}
+    active={shelfFilter}
+    counts={countForShelf}
+    open={menuOpen}
+    onSelect={selectShelf}
+    onAddShelf={(n) => void addShelf(n)}
+    onRemoveShelf={(id) => void removeShelf(id)}
+    onClose={() => (menuOpen = false)}
+  />
+
+  <main class="main">
+    <div class="ambient" aria-hidden="true"></div>
+
+    <header class="topbar" class:scrolled>
+      <button type="button" class="icon menu-btn" aria-label="Меню" onclick={() => (menuOpen = true)}>
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" /></svg>
       </button>
       {#if snapshot?.libraryRoot}
-        <button type="button" class="home-btn home-btn-ghost" onclick={() => void pickBooks()} title="Добавить книги (или перетащите файлы в окно)">
+        <label class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
+          <span class="sr-only">Поиск по библиотеке</span>
+          <input bind:this={searchEl} type="search" placeholder="Найти книгу или автора" bind:value={searchQuery} />
+          {#if !searchQuery}<kbd>/</kbd>{/if}
+        </label>
+      {/if}
+      <span class="grow"></span>
+      {#if snapshot?.libraryRoot}
+        <button type="button" class="icon refresh-btn" title="Обновить библиотеку" aria-label="Обновить" onclick={() => void refresh()}>
+          <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" /></svg>
+        </button>
+        <button type="button" class="icon" title={`Папка библиотеки: ${snapshot.libraryRoot}`} aria-label="Сменить папку" onclick={() => void pickFolder()}>
+          <svg viewBox="0 0 24 24"><path d="M3 7.5h7l2 2h9v9.5H3z" /><path d="M3 7.5V5h7l2 2" /></svg>
+        </button>
+        <button type="button" class="add" onclick={() => void pickBooks()} title="Или просто перетащите файлы в окно">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-          <span class="action-label">Добавить</span>
+          <span>Добавить книги</span>
         </button>
       {/if}
-      <a href="/words" class="home-btn home-btn-ghost" title="Слова из книг и повторение">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19l4.5-12h1L14 19M6 14h6M15 11h5M17.5 8.5v5" /></svg>
-        <span class="action-label">Слова</span>
-      </a>
-      <a href="/notes" class="home-btn home-btn-ghost" title="Все заметки и выделения">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h9l3 3v13H6z" /><path d="M9 11h6M9 15h4" /></svg>
-        <span class="action-label">Заметки</span>
-      </a>
-      <button type="button" class="home-btn home-btn-ghost" onclick={() => void refresh()}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" /></svg>
-        <span class="action-label">Обновить</span>
-      </button>
-      <a href="/settings" class="home-btn home-btn-ghost home-settings-link">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.09A1.7 1.7 0 0 0 9 19.37a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.63 15 1.7 1.7 0 0 0 3.09 14H3v-4h.09A1.7 1.7 0 0 0 4.63 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.63 1.7 1.7 0 0 0 10 3.09V3h4v.09A1.7 1.7 0 0 0 15 4.63a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.37 9 1.7 1.7 0 0 0 20.91 10H21v4h-.09A1.7 1.7 0 0 0 19.4 15Z" /></svg>
-        <span class="action-label">Настройки</span>
-      </a>
-      <button type="button" class="home-btn home-btn-primary" onclick={() => void pickFolder()}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h7l2 2h9v9.5H3z" /><path d="M3 7.5V5h7l2 2h9v2.5" /></svg>
-        <span class="folder-label">Папка библиотеки</span>
-      </button>
-    </div>
-    {#if snapshot?.libraryRoot}
-      <p class="home-path" title={snapshot.libraryRoot}>
-        <span class="home-path-label">корень</span>
-        <span class="home-path-value">{snapshot.libraryRoot}</span>
-      </p>
+    </header>
+
+    {#if banner}
+      <div class="banner" role="alert">{banner}</div>
     {/if}
-  </header>
 
-  {#if banner}
-    <div class="home-banner">{banner}</div>
-  {/if}
-
-  <div class="home-main">
-    <aside class="home-rail" class:home-rail-open={mobileLibraryOpen}>
-      <div class="home-rail-inner">
-        <section class="home-panel">
-          <div class="home-panel-head">
-            <div>
-              <h2 class="home-panel-title">Полки</h2>
-              <p class="home-panel-sub">разделите коллекцию по темам</p>
-            </div>
-            <button
-              type="button"
-              class="rail-close"
-              aria-label="Закрыть полки"
-              onclick={() => (mobileLibraryOpen = false)}
-            >×</button>
-          </div>
-          <div class="shelf-list">
-            <button
-              type="button"
-              class="shelf-pill"
-              class:shelf-pill-active={shelfFilter === "all"}
-              onclick={() => selectShelf("all")}
-            >
-              <span class="shelf-name">Все книги</span>
-              <span class="shelf-count">{countForShelf("all")}</span>
-            </button>
-            {#each shelvesSorted as s (s.id)}
-              <div class="shelf-row-wrap">
-                <button
-                  type="button"
-                  class="shelf-pill"
-                  class:shelf-pill-active={shelfFilter === s.id}
-                  onclick={() => selectShelf(s.id)}
-                >
-                  <span class="shelf-name">{s.name}</span>
-                  <span class="shelf-count">{countForShelf(s.id)}</span>
-                </button>
-                {#if s.id !== "default"}
-                  <button
-                    type="button"
-                    class="shelf-remove"
-                    title="Удалить полку"
-                    onclick={() => void removeShelf(s.id)}>×</button>
-                {/if}
-              </div>
-            {/each}
-            <div class="shelf-hidden-separator" aria-hidden="true"></div>
-            <button
-              type="button"
-              class="shelf-pill shelf-pill-hidden"
-              class:shelf-pill-active={shelfFilter === "hidden"}
-              onclick={() => selectShelf("hidden")}
-            >
-              <span class="shelf-name shelf-hidden-name">
-                <span class="shelf-hidden-mark" aria-hidden="true">◌</span>
-                Скрытые
-              </span>
-              <span class="shelf-count">{countForShelf("hidden")}</span>
-            </button>
-          </div>
-          <div class="add-shelf">
-            <input placeholder="Новая полка…" bind:value={newShelfName} />
-            <button type="button" class="home-btn home-btn-small" onclick={() => void addShelf()}>+</button>
-          </div>
-        </section>
-
-        <RhythmCard />
-
-        <section class="home-panel home-panel-settings">
-          <SettingsThemeCard />
-        </section>
-      </div>
-    </aside>
-
-    <button
-      type="button"
-      class="rail-backdrop"
-      class:rail-backdrop-open={mobileLibraryOpen}
-      aria-label="Закрыть полки"
-      onclick={() => (mobileLibraryOpen = false)}
-    ></button>
-
-    <section class="home-stage">
-      {#if !snapshot?.libraryRoot}
-        <div class="empty-state">
-          <div class="empty-orbit" aria-hidden="true"></div>
-          <p class="empty-kicker">шаг первый</p>
-          <h1 class="empty-heading">Откройте папку с книгами</h1>
-          <p class="empty-body">
-            PDF, EPUB и FB2 появятся здесь как живая полка. Клик — чтение, правая кнопка — сведения и
-            заметки.
-          </p>
-          <button type="button" class="home-btn home-btn-primary empty-cta" onclick={() => void pickFolder()}>
-            Выбрать каталог
-          </button>
+    {#if !snapshot?.libraryRoot}
+      <section class="welcome">
+        <div class="stack" aria-hidden="true">
+          <span class="b b1"></span><span class="b b2"></span><span class="b b3"></span><span class="b b4"></span>
+          <span class="shelf-line"></span>
         </div>
-      {:else if displayedBooks.length === 0 && !searchQuery.trim()}
-        <div class="empty-state empty-state-muted">
-          <div class="empty-orbit empty-orbit-soft" aria-hidden="true"></div>
-          <p class="empty-kicker">{shelfFilter === "hidden" ? "всё на виду" : "ничего не выбрано"}</p>
-          <h1 class="empty-heading">
-            {shelfFilter === "hidden" ? "Скрытых книг нет" : "Тишина на этой полке"}
-          </h1>
-          <p class="empty-body">
-            {shelfFilter === "hidden"
-              ? "Скрытые книги появятся здесь — отсюда их можно вернуть или удалить с диска."
-              : "Перетащите файлы в папку библиотеки или переключите полку слева."}
-          </p>
-        </div>
-      {:else}
-        {#if shelfFilter === "all" && statusFilter === "all" && !searchQuery.trim() && continueBooks.length}
-          <ContinueReading books={continueBooks} onOpen={openBook} />
-        {/if}
-        <div class="stage-head">
-          <div class="stage-intro">
-            <p class="stage-kicker">{shelfFilter === "hidden" ? "вне полок" : "библиотека"}</p>
-            <h1 class="stage-title">{stageHeading}</h1>
-            <p class="stage-meta">
-              {displayedBooks.length}
-              {pluralBooks(displayedBooks.length)}
-              {#if shelfFilter !== "all"}
-                <span class="stage-dot">·</span>
-                <span>{shelfFilter === "hidden" ? "не показываются в библиотеке" : "активная полка"}</span>
-              {/if}
-            </p>
+        <h1>Ваша тихая библиотека</h1>
+        <p>
+          Выберите папку, где лежат книги — PDF, EPUB или FB2. Reader соберёт их на полки, запомнит, где вы остановились,
+          и сохранит ваши заметки. Всё остаётся на вашем устройстве.
+        </p>
+        <button type="button" class="cta" onclick={() => void pickFolder()}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h7l2 2h9v9.5H3z" /><path d="M3 7.5V5h7l2 2" /></svg>
+          Выбрать папку с книгами
+        </button>
+      </section>
+    {:else}
+      {#if showHero}
+        <HomeHero books={continueBooks} total={snapshot.bookPaths.length} onOpen={openBook} onTone={(t) => (tone = t)} />
+      {/if}
+
+      <section class="library">
+        <div class="lib-head">
+          <div class="lib-title">
+            <h2>{heading}</h2>
+            <span class="count">{displayedBooks.length} {pluralBooks(displayedBooks.length)}</span>
           </div>
-          <div class="stage-tools">
-            <label class="search-shell">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
-              <span class="sr-only">Поиск книг</span>
-              <input type="search" placeholder="Название или автор" bind:value={searchQuery} />
-            </label>
-            <div class="view-toggle" role="group" aria-label="Вид">
+          <div class="lib-tools">
+            <div class="seg" role="group" aria-label="Вид">
               <button type="button" class:on={viewMode === "grid"} title="Обложки" aria-label="Обложки" onclick={() => setViewMode("grid")}>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="9" rx="1.5" /><rect x="13" y="4" width="7" height="9" rx="1.5" /><path d="M4 17h16M4 20h10" /></svg>
+                <svg viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="9" rx="1.2" /><rect x="13.5" y="4" width="6.5" height="9" rx="1.2" /><path d="M4 17h6.5M13.5 17H20" /></svg>
               </button>
               <button type="button" class:on={viewMode === "spines"} title="Корешки на полке" aria-label="Корешки" onclick={() => setViewMode("spines")}>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v15M9 6v13M13 3v16M17.5 6.5l3 12M3 20.5h18" /></svg>
+                <svg viewBox="0 0 24 24"><path d="M5 4v15M9 6v13M13 3v16M17.5 6.5l3 12M3 20.5h18" /></svg>
               </button>
             </div>
-            <div class="sort-shell">
-              <span class="sr-only">Упорядочить</span>
+            <div class="sort">
               <DreamSelect
                 value={librarySort}
-                ariaLabel="Упорядочить книги"
+                ariaLabel="Порядок книг"
                 compact
                 options={Object.entries(LIBRARY_SORT_LABELS).map(([value, label]) => ({ value, label }))}
-                onChange={(value) => setLibrarySort(value as LibrarySortMode)}
+                onChange={(v) => setLibrarySort(v as LibrarySortMode)}
               />
             </div>
           </div>
         </div>
-        {#if shelfFilter !== "hidden"}
-          <div class="status-chips" role="group" aria-label="Статус чтения">
+
+        {#if shelfFilter !== "hidden" && Object.keys(statusCounts).length > 1}
+          <div class="chips" role="group" aria-label="Статус чтения">
             {#each STATUS_FILTERS as st (st)}
               {#if st === "all" || statusCounts[st]}
-                <button type="button" class="status-chip" class:on={statusFilter === st} onclick={() => (statusFilter = st)}>
+                <button type="button" class="chip" class:on={statusFilter === st} onclick={() => (statusFilter = st)}>
                   {st === "all" ? "Все" : STATUS_LABELS[st]}
                   {#if st !== "all"}<span>{statusCounts[st]}</span>{/if}
                 </button>
@@ -821,166 +596,146 @@
             {/each}
           </div>
         {/if}
+
         {#if displayedBooks.length === 0}
-          <div class="search-empty">
-            <span class="search-empty-mark" aria-hidden="true">Aa</span>
-            <h2>Книги не найдены</h2>
-            <p>Попробуйте изменить запрос или посмотреть другую полку.</p>
-            <button
-              type="button"
-              class="home-btn"
-              onclick={() => {
-                searchQuery = "";
-                statusFilter = "all";
-              }}>Сбросить фильтры</button>
+          <div class="empty">
+            {#if searchQuery.trim() || statusFilter !== "all"}
+              <p class="empty-title">Ничего не нашлось</p>
+              <p>Попробуйте другой запрос или снимите фильтр.</p>
+              <button
+                type="button"
+                class="ghost"
+                onclick={() => {
+                  searchQuery = "";
+                  statusFilter = "all";
+                }}>Сбросить</button
+              >
+            {:else if shelfFilter === "hidden"}
+              <p class="empty-title">Скрытых книг нет</p>
+              <p>Сюда попадают книги, которые вы убрали с полок, не удаляя файлы.</p>
+            {:else}
+              <p class="empty-title">Полка пока пустая</p>
+              <p>Добавьте книги кнопкой сверху или перетащите файлы прямо в окно.</p>
+            {/if}
           </div>
         {:else if viewMode === "spines"}
           <SpineShelf
             paths={displayedBooks}
-            books={snapshot!.metadata.books}
+            books={snapshot.metadata.books}
             onOpen={(p) => (bookIsHidden(p) ? undefined : openBook(p))}
-            onMenu={(e, p) => onCardContextMenu(e, p)}
+            onMenu={(e, p) => openMenu(e, p)}
           />
         {:else}
-        <ul class="book-grid">
-          {#each displayedBooks as p (p)}
-            {@const meta = snapshot!.metadata.books[p]}
-            {@const fmt = getBookFormat(p)}
-            {@const prog = fmt && meta ? readingProgress(meta, fmt) : null}
-            {@const fileName = titleFromPath(p)}
-            {@const shelfTitle = meta?.title?.trim() ?? ""}
-            {@const cardTitle = shelfTitle || fileName}
-            {@const hiddenBook = bookIsHidden(p)}
-            {@const status = effectiveStatus(meta)}
-            {@const dust = dustLevel(meta)}
-            <li class="book-cell">
-              <button
-                type="button"
-                class="book-card"
-                class:book-card-hidden={hiddenBook}
-                style:--dust={dust.toFixed(2)}
-                title={dustLabel(meta) || undefined}
-                onclick={(e) => (hiddenBook ? onCardContextMenu(e, p) : openBook(p))}
-                oncontextmenu={(e) => onCardContextMenu(e, p)}
-              >
-                <span class="book-spine" aria-hidden="true"></span>
-                <div
-                  class="cover"
-                  class:cover-pdf={fmt === "pdf"}
-                  class:cover-epub={fmt === "epub"}
-                  class:cover-fb2={fmt === "fb2"}
-                  class:cover-typst={fmt === "typst"}
-                  class:cover-unknown={!fmt}
+          <ul class="grid">
+            {#each displayedBooks as p (p)}
+              {@const meta = snapshot.metadata.books[p]}
+              {@const st = effectiveStatus(meta)}
+              {@const prog = bookProgress(meta)}
+              <li class="cell">
+                <button
+                  type="button"
+                  class="card"
+                  class:hidden-book={bookIsHidden(p)}
+                  title={dustLabel(meta) || bookTitle(p, meta)}
+                  onclick={(e) => onCardClick(e, p)}
+                  oncontextmenu={(e) => openMenu(e, p)}
                 >
-                  <BookCoverThumb
-                    bookPath={p}
-                    format={fmt}
-                    needMeta={!!meta && !meta.autoMetaDone}
-                    onMeta={(m) => applyDiscoveredMeta(p, m)}
-                  >
-                    <span class="cover-k">{fmt ? formatBadgeLabel(fmt) : "?"}</span>
-                  </BookCoverThumb>
-                </div>
-                <span class="card-title">{cardTitle}</span>
-                {#if meta?.author?.trim()}
-                  <span class="card-author">{meta.author.trim()}</span>
-                {/if}
-                {#if shelfTitle && shelfTitle !== fileName}
-                  <span class="card-file">{fileName}</span>
-                {/if}
-                <span class="card-status card-status-{status}">
-                  {STATUS_LABELS[status]}
-                  {#if meta?.importance === "essential" || meta?.importance === "high"}
-                    <span class="card-important" title={importanceLabel(meta.importance)}>★</span>
-                  {/if}
-                </span>
-                {#if hiddenBook}
-                  <span class="card-badge-hidden">Скрыта</span>
-                {/if}
-                {#if meta?.translationExported}
-                  <span class="card-badge-trans" title="Есть PDF translate_* с переводом">Переведена</span>
-                {/if}
-                {#if prog && status !== "done"}
-                  <div class="card-progress">
-                    {#if prog.pct != null}
-                      <div class="card-progress-track" aria-hidden="true">
-                        <div class="card-progress-fill" style:width="{prog.pct}%"></div>
-                      </div>
-                    {/if}
-                    <span class="card-progress-cap">{prog.label}</span>
+                  <div class="book-hover-target">
+                    <Book3D
+                      path={p}
+                      {meta}
+                      needMeta={!!meta && !meta.autoMetaDone}
+                      onMeta={(m) => applyDiscoveredMeta(p, m)}
+                    />
                   </div>
-                {/if}
-              </button>
-              <button
-                type="button"
-                class="card-menu-btn"
-                aria-label={`Действия с книгой «${cardTitle}»`}
-                title="Действия с книгой"
-                onclick={(e) => onCardContextMenu(e, p)}
-              >•••</button>
-            </li>
-          {/each}
-        </ul>
+                  {#if st === "done"}
+                    <span class="ribbon" title="Прочитано" aria-hidden="true">✓</span>
+                  {/if}
+                  <span class="card-text">
+                    <span class="t">{bookTitle(p, meta)}</span>
+                    {#if meta?.author?.trim()}<span class="a">{meta.author}</span>{/if}
+                    {#if st === "reading" && prog != null}
+                      <span class="bar"><span style:width="{Math.round(prog * 100)}%"></span></span>
+                    {/if}
+                    <span class="s s-{st}">
+                      {progressLabel(meta)}
+                      {#if meta?.importance === "essential" || meta?.importance === "high"}<span class="star" title="Важная">★</span>{/if}
+                    </span>
+                  </span>
+                </button>
+                <button type="button" class="more" aria-label="Действия с книгой" title="Действия" onclick={(e) => openMenu(e, p)}>
+                  <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.4" /><circle cx="12" cy="12" r="1.4" /><circle cx="19" cy="12" r="1.4" /></svg>
+                </button>
+              </li>
+            {/each}
+          </ul>
         {/if}
-      {/if}
-    </section>
-  </div>
+      </section>
+    {/if}
+  </main>
 </div>
 
+{#if dragActive}
+  <div class="drop" aria-hidden="true">
+    <div class="drop-card">
+      <svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14" /></svg>
+      <p>Отпустите, чтобы добавить книги</p>
+      <small>PDF, EPUB и FB2 скопируются в папку библиотеки</small>
+    </div>
+  </div>
+{/if}
+
 {#if ctxMenu}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div
-    id="ctx-menu"
-    class="ctx-menu"
-    style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;"
-    onclick={(e) => e.stopPropagation()}
-  >
-    {#if bookIsHidden(ctxMenu.path)}
-      <button type="button" class="ctx-item" onclick={() => void restoreBookFromMenu()}>
-        Вернуть в библиотеку
-      </button>
-      <div class="ctx-separator" aria-hidden="true"></div>
-      <button type="button" class="ctx-item ctx-item-danger" onclick={() => startBookAction("delete")}>
-        Удалить файл…
-      </button>
+  {@const cm = ctxMenu}
+  {@const cmMeta = snapshot?.metadata.books[cm.path]}
+  {@const cmFmt = getBookFormat(cm.path)}
+  <div id="ctx-menu" class="ctx" style="left:{cm.x}px;top:{cm.y}px" role="menu">
+    <p class="ctx-title">{bookTitle(cm.path, cmMeta)}</p>
+    {#if bookIsHidden(cm.path)}
+      <button type="button" role="menuitem" onclick={() => void restoreBookFromMenu()}>Вернуть на полку</button>
+      <div class="sep"></div>
+      <button type="button" role="menuitem" class="danger" onclick={() => startBookAction("delete")}>Удалить файл…</button>
     {:else}
-      <button type="button" class="ctx-item" onclick={() => startEdit()}>Редактирование</button>
-      <div class="ctx-statuses" role="group" aria-label="Статус">
+      <button type="button" role="menuitem" onclick={() => { openBook(cm.path); closeCtx(); }}>Читать</button>
+      <button type="button" role="menuitem" onclick={() => { editPath = cm.path; closeCtx(); }}>Изменить сведения…</button>
+      <div class="sep"></div>
+      <p class="ctx-label">Статус</p>
+      <div class="ctx-status">
         {#each READING_STATUS_OPTIONS as o (o.value)}
           <button
             type="button"
-            class="ctx-status"
-            class:on={snapshot?.metadata.books[ctxMenu.path]?.status === o.value}
+            class:on={cmMeta?.status === o.value}
             onclick={() => {
-              setBookStatus(ctxMenu!.path, o.value);
+              setBookStatus(cm.path, o.value);
               closeCtx();
             }}>{o.label}</button
           >
         {/each}
       </div>
-      <div class="ctx-separator" aria-hidden="true"></div>
-      {#if isTauriRuntime() && getBookFormat(ctxMenu.path) === "pdf"}
-        <button
-          type="button"
-          class="ctx-item"
-          onclick={() => {
-            fullTranslateBook = ctxMenu!.path;
-            closeCtx();
-          }}>Перевести книгу…</button>
+      <div class="sep"></div>
+      {#if isTauriRuntime() && cmFmt === "pdf"}
+        <button type="button" role="menuitem" onclick={() => { fullTranslateBook = cm.path; closeCtx(); }}>Перевести книгу…</button>
       {/if}
-      {#if isTauriRuntime() && getBookFormat(ctxMenu.path) && getBookFormat(ctxMenu.path) !== "typst"}
-        <button type="button" class="ctx-item" onclick={() => void exportBookToTypstFromMenu()}>
-          Экспорт в Typst…
-        </button>
+      {#if isTauriRuntime() && cmFmt && cmFmt !== "typst"}
+        <button type="button" role="menuitem" onclick={() => void exportBookToTypstFromMenu()}>Экспорт в Typst…</button>
       {/if}
-      <div class="ctx-separator" aria-hidden="true"></div>
-      <button type="button" class="ctx-item" onclick={() => startBookAction("hide")}>Скрыть книгу</button>
-      <button type="button" class="ctx-item ctx-item-danger" onclick={() => startBookAction("delete")}>
-        Удалить файл…
-      </button>
+      <button type="button" role="menuitem" onclick={() => startBookAction("hide")}>Убрать с полок</button>
+      <button type="button" role="menuitem" class="danger" onclick={() => startBookAction("delete")}>Удалить файл…</button>
     {/if}
   </div>
+{/if}
+
+{#if editPath && editMeta}
+  <BookEditDialog
+    path={editPath}
+    meta={editMeta}
+    shelves={shelvesSorted}
+    onSave={(patch) => {
+      patchBook(editPath!, patch);
+      editPath = null;
+    }}
+    onClose={() => (editPath = null)}
+  />
 {/if}
 
 {#if fullTranslateBook}
@@ -993,412 +748,163 @@
 {/if}
 
 {#if bookAction}
-  {@const actionTitle = snapshot?.metadata.books[bookAction.path]?.title?.trim() || titleFromPath(bookAction.path)}
+  {@const ba = bookAction}
+  {@const baMeta = snapshot?.metadata.books[ba.path]}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-back" onclick={closeBookAction}>
-    <div
-      class="action-dialog"
-      role="alertdialog"
-      aria-modal="true"
-      aria-labelledby="book-action-title"
-      tabindex="-1"
-      onclick={(event) => event.stopPropagation()}
-    >
-      <div class="action-symbol" class:action-symbol-danger={bookAction.kind === "delete"} aria-hidden="true">
-        {bookAction.kind === "delete" ? "×" : "◌"}
-      </div>
-      <p class="action-kicker">{bookAction.kind === "delete" ? "Файл на диске" : "Видимость книги"}</p>
-      <h2 id="book-action-title">
-        {bookAction.kind === "delete" ? "Удалить книгу безвозвратно?" : "Скрыть книгу из библиотеки?"}
-      </h2>
-      <p class="action-copy">
-        {bookAction.kind === "delete"
-          ? "Reader удалит сам файл книги. Отменить это действие после подтверждения нельзя."
-          : "Файл останется на диске, но исчезнет с обычных полок. Вернуть его можно в разделе «Скрытые»."}
-      </p>
-      <div class="action-book">
-        <strong>{actionTitle}</strong>
-        <span>{bookAction.path}</span>
-      </div>
-      {#if bookActionError}
-        <p class="action-error" role="alert">{bookActionError}</p>
-      {/if}
-      <div class="action-buttons">
-        <button type="button" class="home-btn home-btn-ghost" onclick={closeBookAction} disabled={bookActionBusy}>
-          Отмена
-        </button>
-        <button
-          type="button"
-          class="home-btn"
-          class:action-danger-button={bookAction.kind === "delete"}
-          onclick={() => void confirmBookAction()}
-          disabled={bookActionBusy}
-        >
-          {bookActionBusy
-            ? "Подождите…"
-            : bookAction.kind === "delete"
-              ? "Удалить файл"
-              : "Скрыть книгу"}
-        </button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if editOpen && editPath && editMeta && editDraft}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <!-- svelte-ignore a11y_interactive_supports_focus -->
-  <div class="modal-back" onclick={closeEdit}>
-    <div
-      class="modal edit-modal"
-      onclick={(e) => e.stopPropagation()}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="edit-book-title"
-      tabindex="-1"
-    >
-      <aside class="edit-portrait">
-        <div class="edit-halo" aria-hidden="true"></div>
-        <div class="edit-cover">
-          <BookCoverThumb
-            bookPath={editPath}
-            format={getBookFormat(editPath)}
-          >
-            <span class="edit-cover-mark">{getBookFormat(editPath)?.toUpperCase() ?? "BOOK"}</span>
-          </BookCoverThumb>
+  <div class="confirm-back" onclick={closeBookAction}>
+    <div class="confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="confirm-book"><Book3D path={ba.path} meta={baMeta} eager compact tilt={false} /></div>
+      <div class="confirm-body">
+        <h2 id="confirm-title">{ba.kind === "delete" ? "Удалить книгу с диска?" : "Убрать книгу с полок?"}</h2>
+        <p class="confirm-name">{bookTitle(ba.path, baMeta)}</p>
+        <p class="confirm-copy">
+          {ba.kind === "delete"
+            ? "Файл будет удалён безвозвратно вместе с прогрессом и заметками."
+            : "Файл останется на диске. Вернуть книгу можно из раздела «Скрытые»."}
+        </p>
+        {#if bookActionError}<p class="confirm-error" role="alert">{bookActionError}</p>{/if}
+        <div class="confirm-actions">
+          <button type="button" class="ghost" onclick={closeBookAction} disabled={bookActionBusy}>Отмена</button>
+          <button type="button" class="solid" class:danger={ba.kind === "delete"} onclick={() => void confirmBookAction()} disabled={bookActionBusy}>
+            {bookActionBusy ? "Подождите…" : ba.kind === "delete" ? "Удалить" : "Убрать"}
+          </button>
         </div>
-        <p class="edit-portrait-kicker">личная карточка</p>
-        <p class="edit-portrait-name">{editDraft.title.trim() || titleFromPath(editPath)}</p>
-        {#if editDraft.author.trim()}
-          <p class="edit-portrait-author">{editDraft.author}</p>
-        {/if}
-        <p class="modal-path" title={editPath}>{titleFromPath(editPath)}</p>
-      </aside>
-
-      <form
-        class="edit-form"
-        onsubmit={(e) => {
-          e.preventDefault();
-          saveEdit();
-        }}
-      >
-        <header class="modal-h">
-          <div>
-            <p class="edit-kicker">Сведения о книге</p>
-            <h3 id="edit-book-title">Настройте свою полку</h3>
-            <p class="edit-subtitle">Название, заметки и полки останутся только в вашей библиотеке.</p>
-          </div>
-          <button type="button" class="modal-x" aria-label="Закрыть без сохранения" onclick={closeEdit}>×</button>
-        </header>
-
-        <div class="field-grid">
-          <label class="field">
-            <span>Название</span>
-            <input type="text" placeholder="Например, Невидимые города" bind:value={editDraft.title} />
-          </label>
-
-          <label class="field">
-            <span>Автор</span>
-            <input type="text" placeholder="Имя автора" bind:value={editDraft.author} />
-          </label>
-        </div>
-
-        <fieldset class="edit-group">
-          <legend>Статус</legend>
-          <div class="importance-options">
-            {#each READING_STATUS_OPTIONS as o (o.value)}
-              <button
-                type="button"
-                class="importance-option"
-                class:importance-option-active={editDraft.status === o.value}
-                aria-pressed={editDraft.status === o.value}
-                onclick={() => (editDraft = { ...editDraft!, status: editDraft!.status === o.value ? "" : o.value })}
-              >
-                {o.label}
-              </button>
-            {/each}
-          </div>
-        </fieldset>
-
-        <fieldset class="edit-group">
-          <legend>Важность</legend>
-          <div class="importance-options">
-            {#each IMPORTANCE_OPTIONS as o (o.value)}
-              <button
-                type="button"
-                class="importance-option"
-                class:importance-option-active={editDraft.importance === o.value}
-                aria-pressed={editDraft.importance === o.value}
-                onclick={() => (editDraft = { ...editDraft!, importance: o.value })}
-              >
-                <span class="importance-dot importance-{o.value}" aria-hidden="true"></span>
-                {o.label}
-              </button>
-            {/each}
-          </div>
-        </fieldset>
-
-        <fieldset class="edit-group">
-          <legend>Полки</legend>
-          <p class="field-hint">Книга может жить сразу в нескольких коллекциях.</p>
-          <div class="shelf-checks">
-            {#each shelvesSorted as s (s.id)}
-              <label class="shelf-check" class:shelf-check-active={editDraft.shelfIds.includes(s.id)}>
-                <input
-                  type="checkbox"
-                  checked={editDraft.shelfIds.includes(s.id)}
-                  onchange={() => toggleBookShelf(s.id)}
-                />
-                <span class="shelf-check-mark" aria-hidden="true">✓</span>
-                <span>{s.name}</span>
-              </label>
-            {/each}
-          </div>
-        </fieldset>
-
-        <label class="field field-notes">
-          <span>Личные заметки</span>
-          <textarea
-            rows="6"
-            placeholder="Что хочется сохранить после этой книги…"
-            bind:value={editDraft.review}
-          ></textarea>
-          <small>{editDraft.review.length} символов</small>
-        </label>
-
-        <details class="advanced-fields">
-          <summary>Параметры экспорта</summary>
-          <label class="field">
-            <span>Стиль Typst</span>
-            <input
-              type="text"
-              placeholder="Путь к .typ внутри библиотеки"
-              bind:value={editDraft.typstStyleRelativePath}
-            />
-            <small>Оставьте пустым, чтобы использовать общий стиль из настроек.</small>
-          </label>
-        </details>
-
-        <footer class="modal-f">
-          <p>Изменения применятся после сохранения</p>
-          <div class="modal-actions">
-            <button type="button" class="home-btn home-btn-ghost" onclick={closeEdit}>Отмена</button>
-            <button type="submit" class="home-btn home-btn-primary">Сохранить</button>
-          </div>
-        </footer>
-      </form>
+      </div>
     </div>
   </div>
 {/if}
 
 <style>
-  /* ——— Shell & atmosphere ——— */
-  .home {
-    position: relative;
-    isolation: isolate;
+  .app {
     display: flex;
-    flex-direction: column;
-    min-height: 100vh;
     min-height: 100dvh;
-    overflow: hidden;
+    background: var(--bg-soft);
     color: var(--text-soft);
   }
 
-  .home-ambient {
-    position: fixed;
-    inset: -20%;
-    z-index: 0;
+  .main {
+    position: relative;
+    isolation: isolate;
+    flex: 1;
+    min-width: 0;
+    padding: 0 clamp(1rem, 4vw, 3.2rem) 4rem;
+    max-width: 88rem;
+  }
+
+  .ambient {
+    position: absolute;
+    inset: 0 0 auto;
+    height: 34rem;
+    z-index: -1;
     pointer-events: none;
     background:
-      radial-gradient(ellipse 80% 55% at 12% -8%, color-mix(in srgb, var(--accent) 28%, transparent), transparent 52%),
-      radial-gradient(ellipse 70% 50% at 92% 8%, color-mix(in srgb, var(--accent-2) 18%, transparent), transparent 50%),
-      radial-gradient(ellipse 55% 40% at 50% 100%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 45%);
-    opacity: 0.95;
+      radial-gradient(ellipse 60% 70% at 30% 0%, var(--glow), transparent 70%),
+      radial-gradient(ellipse 40% 50% at 90% 10%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 70%);
+    transition: background 1s ease;
   }
 
-  .home-film {
-    position: fixed;
-    inset: 0;
-    z-index: 0;
-    pointer-events: none;
-    opacity: 0.35;
-    background-image: radial-gradient(color-mix(in srgb, var(--text-soft) 6%, transparent) 0.8px, transparent 0.8px);
-    background-size: 20px 20px;
-    mix-blend-mode: multiply;
-  }
-
-  :global([data-theme="dark"]) .home-film {
-    mix-blend-mode: soft-light;
-    opacity: 0.22;
-  }
-
-  /* ——— Top bar ——— */
-  .home-top {
-    position: relative;
-    z-index: 2;
+  /* ——— Верхняя панель ——— */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
-    gap: 0.65rem 1.1rem;
-    padding: 0.85rem clamp(1rem, 3.5vw, 1.6rem);
-    border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 88%, transparent);
-    background: color-mix(in srgb, var(--panel-veil) 96%, transparent);
-    backdrop-filter: blur(14px) saturate(1.2);
+    gap: 0.5rem;
+    padding: max(1rem, env(safe-area-inset-top)) clamp(1rem, 4vw, 3.2rem) 1rem;
+    margin: 0 calc(-1 * clamp(1rem, 4vw, 3.2rem)) 0.6rem;
+    border-bottom: 1px solid transparent;
+    transition:
+      background 0.25s ease,
+      border-color 0.25s ease;
+  }
+
+  .topbar.scrolled {
+    background: color-mix(in srgb, var(--bg-soft) 82%, transparent);
+    backdrop-filter: blur(14px) saturate(1.1);
+    border-bottom-color: color-mix(in srgb, var(--border-soft) 60%, transparent);
+  }
+
+  .grow {
+    flex: 1;
+  }
+
+  .search {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    width: min(28rem, 100%);
+    padding: 0.62rem 0.9rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--border-soft) 75%, transparent);
+    background: color-mix(in srgb, var(--panel-elevated) 85%, transparent);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 1px 2px rgba(20, 14, 30, 0.04);
+    transition:
+      border-color 0.2s ease,
+      box-shadow 0.2s ease;
+  }
+
+  .search:focus-within {
+    border-color: var(--accent-2);
+    box-shadow: var(--focus-ring);
+  }
+
+  .search svg {
+    width: 1.05rem;
+    height: 1.05rem;
     flex-shrink: 0;
-    box-shadow: 0 1px 0 color-mix(in srgb, var(--elevated-soft) 65%, transparent);
+    fill: none;
+    stroke: var(--muted);
+    stroke-width: 1.8;
+    stroke-linecap: round;
   }
 
-  .home-brand {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
+  .search input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text-soft);
+    font: inherit;
+    font-size: 0.95rem;
   }
 
-  .home-mark {
+  .search kbd {
+    font-family: inherit;
+    font-size: 0.72rem;
+    color: var(--muted);
+    border: 1px solid var(--border-soft);
+    border-radius: 0.35rem;
+    padding: 0 0.35rem;
+  }
+
+  .icon {
     display: grid;
     place-items: center;
     width: 2.5rem;
     height: 2.5rem;
-    border-radius: 0.75rem;
-    background: linear-gradient(
-      135deg,
-      color-mix(in srgb, var(--accent) 55%, var(--elevated-soft)),
-      color-mix(in srgb, var(--accent-2) 35%, var(--panel-soft))
-    );
-    box-shadow:
-      0 4px 16px color-mix(in srgb, var(--accent-2) 22%, transparent),
-      inset 0 1px 0 color-mix(in srgb, #fff 42%, transparent);
-    position: relative;
-    overflow: hidden;
-  }
-
-  .home-mark::after {
-    content: "";
-    position: absolute;
-    inset: -40%;
-    background: repeating-linear-gradient(
-      -28deg,
-      transparent,
-      transparent 6px,
-      color-mix(in srgb, #fff 12%, transparent) 6px,
-      color-mix(in srgb, #fff 12%, transparent) 7px
-    );
-    opacity: 0.5;
-    transform: rotate(8deg);
-  }
-
-  .home-brand-text {
-    display: flex;
-    flex-direction: column;
-    gap: 0.12rem;
-    min-width: 0;
-  }
-
-  .home-logo {
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    font-weight: 700;
-    font-size: 1.28rem;
-    letter-spacing: -0.03em;
-    background: linear-gradient(
-      120deg,
-      var(--accent-2) 0%,
-      color-mix(in srgb, var(--accent) 85%, var(--text-soft)) 55%,
-      var(--accent-2) 100%
-    );
-    background-size: 160% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    line-height: 1.1;
-  }
-
-  .home-tagline {
-    font-size: 0.72rem;
-    letter-spacing: 0.07em;
-    text-transform: uppercase;
-    font-weight: 600;
-    color: var(--muted);
-  }
-
-  .home-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-left: auto;
-    align-items: center;
-  }
-
-  .home-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.4rem;
-    padding: 0.52rem 1rem;
     border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 92%, transparent);
-    background: color-mix(in srgb, var(--elevated-soft) 94%, transparent);
+    border: none;
+    background: transparent;
     color: var(--text-soft);
     cursor: pointer;
-    font-size: 0.86rem;
-    font-weight: 600;
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    transition:
-      transform 0.18s cubic-bezier(0.33, 1, 0.68, 1),
-      border-color 0.15s ease,
-      box-shadow 0.15s ease,
-      background 0.15s ease;
+    transition: background 0.15s ease;
   }
 
-  .home-btn:hover {
-    transform: translateY(-1px);
-    border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
-    box-shadow: 0 10px 28px color-mix(in srgb, var(--accent-2) 12%, transparent);
+  .icon:hover {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
   }
 
-  .home-btn:active {
-    transform: translateY(0);
-  }
-
-  .home-btn:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
-    outline-offset: 3px;
-  }
-
-  .home-btn-primary {
-    border-color: color-mix(in srgb, var(--accent-2) 38%, var(--border-soft));
-    background: linear-gradient(
-      135deg,
-      color-mix(in srgb, var(--accent) 22%, var(--elevated-soft)),
-      color-mix(in srgb, var(--accent-2) 12%, var(--elevated-soft))
-    );
-    box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 44%, transparent),
-      0 6px 20px color-mix(in srgb, var(--accent-2) 14%, transparent);
-  }
-
-  :global([data-theme="dark"]) .home-btn-primary {
-    box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 14%, transparent),
-      0 6px 24px rgba(0, 0, 0, 0.35);
-  }
-
-  .home-btn-ghost {
-    background: transparent;
-    border-color: color-mix(in srgb, var(--border-soft) 72%, transparent);
-  }
-
-  .home-btn-small {
-    padding: 0.38rem 0.72rem;
-    min-width: 2.35rem;
-  }
-
-  .home-btn svg,
-  .search-shell svg {
-    width: 1.05rem;
-    height: 1.05rem;
-    flex: 0 0 auto;
+  .icon svg,
+  .add svg,
+  .cta svg,
+  .seg svg,
+  .more svg {
+    width: 1.15rem;
+    height: 1.15rem;
     fill: none;
     stroke: currentColor;
     stroke-width: 1.8;
@@ -1406,2320 +912,457 @@
     stroke-linejoin: round;
   }
 
-  .home-settings-link {
-    text-decoration: none;
-  }
-
-  .home-shelves-toggle,
-  .rail-close,
-  .rail-backdrop {
+  .menu-btn {
     display: none;
   }
 
-  .home-path {
-    flex-basis: 100%;
-    margin: 0;
-    display: flex;
-    align-items: baseline;
-    gap: 0.5rem;
-    min-width: 0;
-    font-family: ui-monospace, monospace;
-    font-size: 0.72rem;
-    color: var(--muted);
+  .add {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.62rem 1.1rem;
+    border: none;
+    border-radius: 999px;
+    background: var(--text-soft);
+    color: var(--bg-soft);
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    cursor: pointer;
+    box-shadow: 0 8px 20px -10px var(--text-soft);
+    transition: transform 0.2s ease;
   }
 
-  .home-path-label {
-    flex-shrink: 0;
-    font-size: 0.62rem;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--accent-2) 75%, var(--muted));
+  .add:hover {
+    transform: translateY(-1px);
   }
 
-  .home-path-value {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    opacity: 0.95;
-  }
-
-  .home-banner {
-    position: relative;
-    z-index: 2;
-    padding: 0.65rem 1.25rem;
-    flex-shrink: 0;
-    font-size: 0.87rem;
-    background: linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--danger) 32%, var(--panel-soft)),
-      color-mix(in srgb, var(--danger) 18%, var(--panel-soft))
-    );
-    border-bottom: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
-    color: color-mix(in srgb, var(--danger) 58%, var(--text-soft));
-    overflow-wrap: anywhere;
-  }
-
-  /* ——— Layout ——— */
-  .home-main {
-    position: relative;
-    z-index: 1;
-    display: grid;
-    grid-template-columns: minmax(272px, 320px) 1fr;
-    grid-template-rows: minmax(0, 1fr);
-    flex: 1;
-    min-height: 0;
-  }
-
-  .home-rail {
-    padding: 1rem 0 1rem 1rem;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .home-rail-inner {
-    display: flex;
-    flex-direction: column;
-    gap: 0.85rem;
-    min-height: 0;
-    flex: 1;
-    padding: 0.25rem;
-  }
-
-  .home-panel {
-    border-radius: 1.15rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 80%, transparent);
-    background: color-mix(in srgb, var(--elevated-soft) 88%, var(--panel-soft));
-    box-shadow:
-      var(--shadow-soft),
-      inset 0 1px 0 color-mix(in srgb, #fff 52%, transparent);
-    padding: 1.05rem 1rem 1.1rem;
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    backdrop-filter: blur(8px);
-  }
-
-  :global([data-theme="dark"]) .home-panel {
-    box-shadow: var(--shadow-soft);
-  }
-
-  .home-panel-settings {
-    flex: 0 1 auto;
-    max-height: 48%;
-  }
-
-  .home-panel-head {
+  .banner {
     margin-bottom: 1rem;
+    padding: 0.8rem 1rem;
+    border-radius: 1rem;
+    background: color-mix(in srgb, var(--danger) 12%, var(--panel-elevated));
+    color: var(--danger);
+    font-size: 0.9rem;
+  }
+
+  /* ——— Приветствие без библиотеки ——— */
+  .welcome {
+    max-width: 36rem;
+    margin: 8vh auto 0;
+    text-align: center;
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
+    flex-direction: column;
+    align-items: center;
     gap: 1rem;
   }
 
-  .home-panel-title {
-    margin: 0;
-    font-size: 1.05rem;
-    font-weight: 700;
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  .welcome h1 {
+    margin: 0.6rem 0 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-weight: 500;
+    font-size: clamp(2rem, 5vw, 2.8rem);
     letter-spacing: -0.02em;
-    color: var(--text-soft);
   }
 
-  .home-panel-sub {
-    margin: 0.3rem 0 0;
-    font-size: 0.78rem;
-    line-height: 1.4;
+  .welcome p {
+    margin: 0;
     color: var(--muted);
+    line-height: 1.6;
   }
 
-  .shelf-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.42rem;
-  }
-
-  .shelf-row-wrap {
-    display: flex;
-    align-items: stretch;
-    gap: 0.38rem;
-  }
-
-  .shelf-pill {
-    flex: 1;
-    display: flex;
+  .cta {
+    display: inline-flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 0.65rem;
-    text-align: left;
-    padding: 0.55rem 0.65rem;
-    border-radius: 0.85rem;
-    border: 1px solid transparent;
-    background: color-mix(in srgb, var(--panel-soft) 55%, transparent);
-    color: var(--text-soft);
-    cursor: pointer;
-    font-size: 0.9rem;
-    font-family: inherit;
-    transition:
-      border-color 0.15s ease,
-      background 0.15s ease,
-      box-shadow 0.15s ease,
-      transform 0.14s ease;
-  }
-
-  .shelf-pill:hover {
-    background: color-mix(in srgb, var(--accent) 9%, var(--elevated-soft));
-    border-color: color-mix(in srgb, var(--accent) 22%, transparent);
-    transform: translateX(2px);
-  }
-
-  .shelf-pill-active {
-    border-color: color-mix(in srgb, var(--accent-2) 38%, var(--border-soft));
-    background: linear-gradient(
-      120deg,
-      color-mix(in srgb, var(--accent) 16%, var(--elevated-soft)),
-      color-mix(in srgb, var(--accent-2) 8%, var(--elevated-soft))
-    );
-    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 42%, transparent);
-  }
-
-  :global([data-theme="dark"]) .shelf-pill-active {
-    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 12%, transparent);
-  }
-
-  .shelf-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 600;
-  }
-
-  .shelf-count {
-    flex-shrink: 0;
-    min-width: 1.85rem;
-    padding: 0.12rem 0.45rem;
-    border-radius: 999px;
-    font-size: 0.7rem;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0.03em;
-    background: color-mix(in srgb, var(--text-soft) 8%, transparent);
-    color: var(--muted);
-  }
-
-  .shelf-pill-active .shelf-count {
-    background: color-mix(in srgb, var(--accent-2) 22%, transparent);
-    color: var(--accent-2);
-  }
-
-  .shelf-remove {
-    width: 2.15rem;
-    flex-shrink: 0;
+    gap: 0.6rem;
+    margin-top: 0.8rem;
+    padding: 0.9rem 1.5rem;
     border: none;
-    border-radius: 0.65rem;
-    background: transparent;
-    color: var(--muted);
+    border-radius: 999px;
+    background: var(--text-soft);
+    color: var(--bg-soft);
+    font: inherit;
+    font-weight: 600;
     cursor: pointer;
-    font-size: 1.1rem;
-    line-height: 1;
-    transition:
-      background 0.12s ease,
-      color 0.12s ease,
-      transform 0.12s ease;
+    box-shadow: 0 14px 30px -14px var(--text-soft);
   }
 
-  .shelf-remove:hover {
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-    transform: scale(1.05);
-  }
-
-  .add-shelf {
-    display: flex;
-    gap: 0.45rem;
-    margin-top: 0.95rem;
-  }
-
-  .add-shelf input {
-    flex: 1;
-    min-width: 0;
-    padding: 0.48rem 0.62rem;
-    border-radius: 0.85rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 90%, transparent);
-    background: var(--elevated-soft);
-    color: var(--text-soft);
-    font-size: 0.86rem;
-  }
-
-  .add-shelf input::placeholder {
-    color: color-mix(in srgb, var(--muted) 88%, transparent);
-  }
-
-  .add-shelf input:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
-    outline-offset: 1px;
-  }
-
-  /* ——— Stage (library) ——— */
-  .home-stage {
+  .stack {
     position: relative;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: clamp(1rem, 2.2vw, 1.85rem);
-    padding-left: clamp(0.85rem, 2vw, 1.35rem);
-    min-height: 0;
-    min-width: 0;
+    width: 12rem;
+    height: 9rem;
   }
 
-  .home-stage::before {
-    content: "";
+  .stack .b {
     position: absolute;
-    inset: -1px;
-    z-index: 0;
-    background: linear-gradient(
-      155deg,
-      color-mix(in srgb, var(--bg-soft) 97%, transparent) 0%,
-      color-mix(in srgb, var(--panel-soft) 35%, var(--bg-soft)) 52%,
-      var(--bg-soft) 100%
-    );
-    pointer-events: none;
+    bottom: 10px;
+    width: 2.1rem;
+    border-radius: 3px 3px 1px 1px;
+    box-shadow: inset -4px 0 0 rgba(0, 0, 0, 0.12);
+    animation: bob 5s ease-in-out infinite;
   }
 
-  .home-stage > * {
-    position: relative;
-    z-index: 1;
+  .b1 {
+    left: 2.2rem;
+    height: 6.6rem;
+    background: #3b3355;
+  }
+  .b2 {
+    left: 4.45rem;
+    height: 7.6rem;
+    background: #6b4a2b;
+    animation-delay: 0.4s !important;
+  }
+  .b3 {
+    left: 6.7rem;
+    height: 6rem;
+    background: #28463d;
+    animation-delay: 0.8s !important;
+  }
+  .b4 {
+    left: 8.6rem;
+    height: 6.9rem;
+    background: var(--accent);
+    transform-origin: bottom left;
+    transform: rotate(14deg);
+    animation: none !important;
   }
 
-  /* empty */
-  .empty-state {
-    max-width: 26rem;
-    margin: clamp(5rem, 12vh, 9rem) auto;
-    text-align: center;
-    padding: 2.5rem 1.75rem;
-    position: relative;
-  }
-
-  .empty-state-muted {
-    max-width: 24rem;
-  }
-
-  .empty-orbit {
+  .shelf-line {
     position: absolute;
-    left: 50%;
-    top: 42%;
-    width: clamp(260px, 65vw, 380px);
-    height: clamp(260px, 65vw, 380px);
-    translate: -50% -50%;
-    border-radius: 50%;
-    border: 1px solid color-mix(in srgb, var(--accent-2) 22%, transparent);
-    background: radial-gradient(
-      circle at 40% 35%,
-      color-mix(in srgb, var(--accent) 14%, transparent),
-      transparent 62%
-    );
-    opacity: 0.9;
-    z-index: -1;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 10px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--text-soft) 22%, var(--panel-soft));
   }
 
-  .empty-orbit-soft {
-    opacity: 0.55;
-    border-color: color-mix(in srgb, var(--border-soft) 55%, transparent);
+  @keyframes bob {
+    50% {
+      transform: translateY(-4px);
+    }
   }
 
-  .empty-kicker {
-    margin: 0 0 0.85rem;
-    font-size: 0.74rem;
-    font-weight: 700;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--accent-2) 70%, var(--muted));
+  /* ——— Библиотека ——— */
+  .library {
+    margin-top: 3rem;
   }
 
-  .empty-heading {
-    margin: 0 0 0.85rem;
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    font-size: clamp(1.45rem, 4.2vw, 2rem);
-    font-weight: 800;
-    letter-spacing: -0.035em;
-    line-height: 1.12;
-    color: var(--text-soft);
-    text-wrap: balance;
-  }
-
-  .empty-body {
-    margin: 0 0 1.75rem;
-    font-size: 1rem;
-    line-height: 1.62;
-    color: var(--muted);
-    text-wrap: pretty;
-  }
-
-  .empty-cta {
-    padding-inline: 1.65rem;
-  }
-
-  /* stage header */
-  .stage-head {
+  .lib-head {
     display: flex;
-    flex-wrap: wrap;
     align-items: flex-end;
     justify-content: space-between;
-    gap: 1rem 1.5rem;
-    margin-bottom: 1.5rem;
+    gap: 1rem;
+    flex-wrap: wrap;
     padding-bottom: 1rem;
-    border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent);
+    margin-bottom: 1rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 70%, transparent);
   }
 
-  .stage-tools {
+  .lib-title {
     display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 0.6rem;
-    min-width: min(100%, 28rem);
+    align-items: baseline;
+    gap: 0.8rem;
   }
 
-  .search-shell {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex: 1 1 15rem;
-    min-width: 10rem;
-    height: 2.55rem;
-    padding: 0 0.8rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 86%, transparent);
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--elevated-soft) 94%, transparent);
+  .lib-title h2 {
+    margin: 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-weight: 500;
+    font-size: clamp(1.5rem, 3vw, 2rem);
+    letter-spacing: -0.01em;
+  }
+
+  .count {
     color: var(--muted);
-    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 42%, transparent);
-    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+    font-size: 0.9rem;
   }
 
-  .search-shell:focus-within {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft));
-    box-shadow: var(--focus-ring);
+  .lib-tools {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .seg {
+    display: flex;
+    padding: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel-soft) 80%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border-soft) 70%, transparent);
+  }
+
+  .seg button {
+    display: grid;
+    place-items: center;
+    width: 2.2rem;
+    height: 2rem;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .seg button.on {
     background: var(--elevated-soft);
+    color: var(--text-soft);
+    box-shadow: 0 1px 3px rgba(20, 14, 30, 0.1);
   }
 
-  .search-shell input {
-    width: 100%;
-    min-width: 0;
-    border: 0;
-    outline: 0;
+  .sort {
+    min-width: 12rem;
+  }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 1.8rem;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.38rem 0.85rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--border-soft) 80%, transparent);
     background: transparent;
     color: var(--text-soft);
+    font: inherit;
     font-size: 0.85rem;
-  }
-
-  .search-shell input::placeholder {
-    color: var(--muted);
-    opacity: 0.85;
-  }
-
-  .search-shell input::-webkit-search-cancel-button {
     cursor: pointer;
+    transition: background 0.15s ease;
   }
 
-  .stage-kicker {
-    margin: 0 0 0.35rem;
+  .chip:hover {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+
+  .chip span {
     font-size: 0.74rem;
-    font-weight: 700;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--accent-2) 72%, var(--muted));
-  }
-
-  .stage-title {
-    margin: 0;
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    font-size: clamp(1.65rem, 4.5vw, 2.15rem);
-    font-weight: 800;
-    letter-spacing: -0.04em;
-    line-height: 1.05;
-    background: linear-gradient(
-      120deg,
-      var(--text-soft) 0%,
-      color-mix(in srgb, var(--accent-2) 45%, var(--text-soft)) 100%
-    );
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-  }
-
-  .stage-meta {
-    margin: 0.45rem 0 0;
-    font-size: 0.9rem;
-    color: var(--muted);
-    letter-spacing: 0.01em;
-  }
-
-  .stage-dot {
-    opacity: 0.5;
-    margin: 0 0.35rem;
-  }
-
-  .sort-shell {
-    display: block;
-    flex: 0 1 12.5rem;
-  }
-
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
-
-  .search-empty {
-    width: min(100%, 30rem);
-    margin: clamp(2.5rem, 9vh, 6rem) auto;
-    padding: 2rem;
-    text-align: center;
-    border: 1px dashed color-mix(in srgb, var(--border-soft) 92%, transparent);
-    border-radius: var(--radius-xl);
-    background: color-mix(in srgb, var(--elevated-soft) 52%, transparent);
-  }
-
-  .search-empty-mark {
-    display: grid;
-    place-items: center;
-    width: 3.4rem;
-    height: 3.4rem;
-    margin: 0 auto 1rem;
-    border-radius: 1.05rem;
-    background: color-mix(in srgb, var(--accent) 14%, var(--elevated-soft));
-    color: var(--accent-2);
-    font: 700 0.9rem/1 system-ui, sans-serif;
-    letter-spacing: -0.04em;
-  }
-
-  .search-empty h2 {
-    margin: 0;
-    color: var(--text-soft);
-    font: 750 1.25rem/1.2 system-ui, sans-serif;
-    letter-spacing: -0.025em;
-  }
-
-  .search-empty p {
-    margin: 0.55rem 0 1.25rem;
-    color: var(--muted);
-    font-size: 0.88rem;
-    line-height: 1.5;
-  }
-
-  /* ——— Book grid ——— */
-  .book-grid {
-    list-style: none;
-    margin: 0;
-    padding: 0 0 2rem;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 10.25rem), 1fr));
-    gap: 1.25rem 1.35rem;
-    align-items: stretch;
-  }
-
-  .book-cell {
-    display: flex;
-    min-width: 0;
-    perspective: 820px;
-    position: relative;
-  }
-
-  .book-cell:nth-child(3n + 2) .book-card {
-    transform: rotateZ(-0.55deg);
-  }
-
-  .book-cell:nth-child(3n) .book-card {
-    transform: rotateZ(0.45deg);
-  }
-
-  .book-card {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 0.52rem;
-    width: 100%;
-    padding: 0.65rem 0.65rem 0.75rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 75%, transparent);
-    background: linear-gradient(
-      165deg,
-      color-mix(in srgb, var(--elevated-soft) 100%, transparent),
-      color-mix(in srgb, var(--panel-soft) 22%, var(--elevated-soft))
-    );
-    cursor: pointer;
-    text-align: left;
-    border-radius: 1.05rem;
-    box-shadow:
-      0 2px 0 color-mix(in srgb, #fff 52%, transparent) inset,
-      0 18px 42px color-mix(in srgb, var(--text-soft) 6%, transparent);
-    transition:
-      transform 0.22s cubic-bezier(0.33, 1, 0.68, 1),
-      border-color 0.18s ease,
-      box-shadow 0.22s ease;
-  }
-
-  :global([data-theme="dark"]) .book-card {
-    box-shadow:
-      0 1px 0 color-mix(in srgb, #fff 12%, transparent) inset,
-      0 20px 48px rgba(0, 0, 0, 0.35);
-  }
-
-  .book-spine {
-    position: absolute;
-    left: 0.62rem;
-    top: 1.15rem;
-    bottom: 42%;
-    width: 3px;
-    border-radius: 2px;
-    background: linear-gradient(
-      180deg,
-      transparent,
-      color-mix(in srgb, var(--accent-2) 45%, transparent),
-      color-mix(in srgb, var(--accent) 25%, transparent),
-      transparent
-    );
-    opacity: 0;
-    transition: opacity 0.18s ease;
-    pointer-events: none;
-  }
-
-  .book-card:hover .book-spine,
-  .book-card:focus-visible .book-spine {
-    opacity: 1;
-  }
-
-  .book-card:hover {
-    transform: translateY(-6px) rotateZ(0deg) scale(1.02);
-    border-color: color-mix(in srgb, var(--accent-2) 32%, var(--border-soft));
-    box-shadow:
-      0 2px 0 color-mix(in srgb, #fff 48%, transparent) inset,
-      var(--shadow-book),
-      0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-
-  :global([data-theme="dark"]) .book-card:hover {
-    box-shadow:
-      0 1px 0 color-mix(in srgb, #fff 10%, transparent) inset,
-      var(--shadow-book),
-      0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
-  }
-
-  .book-card:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
-    outline-offset: 4px;
-  }
-
-  .card-menu-btn {
-    position: absolute;
-    top: 0.92rem;
-    right: 0.92rem;
-    z-index: 3;
-    display: grid;
-    place-items: center;
-    width: 2rem;
-    height: 2rem;
-    padding: 0 0 0.35rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 72%, transparent);
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--panel-elevated) 88%, transparent);
-    color: var(--text-soft);
-    box-shadow: 0 5px 16px rgba(0, 0, 0, 0.12);
-    backdrop-filter: blur(8px);
-    cursor: pointer;
-    font: 700 0.82rem/1 system-ui, sans-serif;
-    letter-spacing: 0.05em;
-    opacity: 0;
-    transform: translateY(-3px);
-    transition: opacity 0.16s ease, transform 0.16s ease, background 0.16s ease;
-  }
-
-  .book-cell:hover .card-menu-btn,
-  .card-menu-btn:focus-visible {
-    opacity: 1;
-    transform: translateY(0);
-  }
-
-  .card-menu-btn:hover {
-    background: var(--panel-elevated);
-    color: var(--accent-2);
-  }
-
-  /* Явные классы — не пересекаются с «нейтральной» обложкой и не путаются с PDF */
-  .cover {
-    aspect-ratio: 3 / 4;
-    border-radius: 0.72rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-    box-shadow:
-      0 4px 16px color-mix(in srgb, var(--text-soft) 12%, transparent),
-      inset 0 1px 0 color-mix(in srgb, #fff 38%, transparent);
-    border: 1px solid color-mix(in srgb, var(--border-soft) 78%, #b0a69a);
-    background: linear-gradient(160deg, #e5e0da, #d0cac2);
-  }
-  .cover :global(.thumb-fallback) {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: 100%;
-  }
-
-  .cover.cover-pdf {
-    background: linear-gradient(155deg, #e5d9cc, #c9b8a8);
-    border-color: color-mix(in srgb, #a08060 28%, var(--border-soft));
-  }
-
-  .cover.cover-epub {
-    background: linear-gradient(155deg, #dcd6ee, #b8aed4);
-    border-color: color-mix(in srgb, #6b5b9e 22%, var(--border-soft));
-  }
-
-  .cover.cover-fb2 {
-    background: linear-gradient(155deg, #7ecfb0, #3d9b7a);
-    border-color: color-mix(in srgb, #1d6b52 45%, var(--border-soft));
-    box-shadow:
-      0 2px 12px rgba(30, 110, 85, 0.25),
-      inset 0 1px 0 rgba(255, 255, 255, 0.35);
-  }
-
-  .cover.cover-typst {
-    background: linear-gradient(155deg, #e8c86a, #c49a3c);
-    border-color: color-mix(in srgb, #8b6914 35%, var(--border-soft));
-  }
-
-  .cover.cover-unknown {
-    background: linear-gradient(155deg, #e8e4df, #cdc8c0);
-  }
-
-  .cover-k {
-    font-size: 0.7rem;
-    font-weight: 750;
-    letter-spacing: 0.16em;
-    color: #3d3833;
-  }
-
-  .cover.cover-pdf .cover-k {
-    color: #4a3528;
-  }
-
-  .cover.cover-epub .cover-k {
-    color: #3d3555;
-  }
-
-  .cover.cover-fb2 .cover-k {
-    color: #f4fffb;
-    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
-  }
-
-  .cover.cover-typst .cover-k {
-    color: #2a2218;
-  }
-
-  .cover.cover-unknown .cover-k {
-    color: var(--muted);
-  }
-
-  .card-title {
-    font-size: 0.84rem;
-    line-height: 1.35;
-    color: var(--text-soft);
-    display: -webkit-box;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    min-height: 3.2em;
-  }
-
-  .card-file {
-    font-size: 0.68rem;
-    line-height: 1.25;
-    color: var(--muted);
-    display: -webkit-box;
-    -webkit-line-clamp: 1;
-    line-clamp: 1;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    word-break: break-word;
-  }
-
-  .card-author {
-    margin-top: -0.2rem;
-    font-size: 0.74rem;
-    line-height: 1.3;
-    color: var(--muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .card-meta {
-    font-size: 0.72rem;
-    color: var(--accent-2);
-    opacity: 0.95;
-  }
-
-  .card-badge-trans {
-    font-size: 0.65rem;
-    font-weight: 600;
-    padding: 0.12rem 0.4rem;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--accent) 22%, transparent);
-    color: var(--accent-2);
-    width: fit-content;
-    margin-top: 0.15rem;
-  }
-
-  .card-progress {
-    display: flex;
-    flex-direction: column;
-    gap: 0.28rem;
-    margin-top: 0.15rem;
-    min-height: 0;
-  }
-
-  .card-progress-track {
-    height: 4px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--border-soft) 88%, transparent);
-    overflow: hidden;
-  }
-
-  .card-progress-fill {
-    height: 100%;
-    border-radius: inherit;
-    background: linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--accent) 55%, var(--accent-2)),
-      var(--accent-2)
-    );
-    min-width: 4px;
-    transition: width 0.25s ease;
-  }
-
-  .card-progress-cap {
-    font-size: 0.66rem;
-    line-height: 1.3;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
+  }
+
+  .chip.on {
+    background: var(--text-soft);
+    border-color: var(--text-soft);
+    color: var(--bg-soft);
+  }
+
+  .chip.on span {
+    color: inherit;
+    opacity: 0.7;
+  }
+
+  .grid {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 9.5rem), 1fr));
+    gap: 2.4rem clamp(1.2rem, 2.4vw, 2rem);
+  }
+
+  .cell {
+    position: relative;
+    min-width: 0;
+  }
+
+  .card {
+    position: relative;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+
+  .card:focus-visible {
+    outline: none;
+  }
+
+  .card:focus-visible .book-hover-target {
+    outline: 2px solid var(--accent-2);
+    outline-offset: 6px;
+    border-radius: 6px;
+  }
+
+  .card.hidden-book {
+    opacity: 0.55;
+  }
+
+  .ribbon {
+    position: absolute;
+    top: -4px;
+    right: 12%;
+    z-index: 4;
+    width: 1.35rem;
+    padding: 0.35rem 0 0.55rem;
+    text-align: center;
+    font-size: 0.7rem;
+    color: #fff;
+    background: #5f9a6e;
+    clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 82%, 0 100%);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  }
+
+  .card-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.22rem;
+    min-width: 0;
+  }
+
+  .t {
+    font-family: "Literata Variable", Georgia, serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    line-height: 1.3;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
-  }
-
-  .ctx-menu {
-    position: fixed;
-    z-index: 80;
-    min-width: 11.5rem;
-    padding: 0.4rem;
-    border-radius: 0.85rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 88%, transparent);
-    background: color-mix(in srgb, var(--panel-elevated) 98%, transparent);
-    backdrop-filter: blur(10px);
-    box-shadow: var(--shadow-float);
-  }
-
-  .ctx-item {
-    width: 100%;
-    text-align: left;
-    padding: 0.48rem 0.65rem;
-    border: none;
-    border-radius: 0.55rem;
-    background: transparent;
-    color: var(--text-soft);
-    cursor: pointer;
-    font-size: 0.89rem;
-    font-weight: 500;
-    transition: background 0.12s ease;
-  }
-
-  .ctx-item:hover {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-
-  .modal-back {
-    position: fixed;
-    inset: 0;
-    z-index: 90;
-    background: color-mix(in srgb, var(--text-soft) 48%, transparent);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1rem;
-    backdrop-filter: blur(10px);
-  }
-
-  .modal {
-    width: min(26rem, 100%);
-    max-height: min(90vh, 36rem);
-    overflow: auto;
-    border-radius: 1.1rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 85%, transparent);
-    background: var(--panel-elevated);
-    box-shadow: var(--shadow-float);
-    padding: 0 1.15rem 1.05rem;
-  }
-
-  .modal-h {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.85rem 0 0.25rem;
-    position: sticky;
-    top: 0;
-    background: var(--panel-elevated);
-    z-index: 1;
-  }
-
-  .modal-h h3 {
-    margin: 0;
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text-soft);
-    font-family: system-ui, sans-serif;
-  }
-
-  .modal-x {
-    border: none;
-    background: transparent;
-    font-size: 1.35rem;
-    line-height: 1;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 0.2rem;
-    border-radius: 0.45rem;
-  }
-
-  .modal-x:hover {
-    color: var(--text-soft);
-    background: var(--elevated-soft);
-  }
-
-  .modal-path {
-    margin: 0 0 1rem;
-    font-size: 0.88rem;
-    color: var(--muted);
-    word-break: break-word;
-  }
-
-  .field-hint {
-    margin: 0 0 0.4rem;
-    font-size: 0.72rem;
-    color: var(--muted);
-  }
-
-  .shelf-checks {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-
-  .shelf-check {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    font-size: 0.86rem;
-    cursor: pointer;
-    color: var(--text-soft);
-  }
-
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    margin-bottom: 0.85rem;
-    font-size: 0.78rem;
-    color: var(--muted);
-  }
-
-  .field textarea {
-    padding: 0.48rem 0.55rem;
-    border-radius: 0.65rem;
-    border: 1px solid var(--border-soft);
-    background: var(--elevated-soft);
-    color: var(--text-soft);
-    font-size: 0.9rem;
-  }
-
-  .field textarea {
-    resize: vertical;
-    min-height: 7rem;
-    line-height: 1.45;
-  }
-
-  .modal-f {
-    padding-top: 0.5rem;
-    display: flex;
-    justify-content: flex-end;
-  }
-
-  .shelf-hidden-separator {
-    height: 1px;
-    margin: 0.45rem 0.35rem;
-    background: color-mix(in srgb, var(--accent) 16%, var(--border-soft));
-  }
-
-  .shelf-hidden-name {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.45rem;
-  }
-
-  .shelf-hidden-mark {
-    color: var(--muted);
-    font-size: 1rem;
-  }
-
-  .book-card-hidden {
-    opacity: 0.72;
-    filter: saturate(0.42);
-  }
-
-  .book-card-hidden:hover {
-    opacity: 0.94;
-    filter: saturate(0.72);
-  }
-
-  .card-badge-hidden {
-    width: fit-content;
-    margin-top: 0.1rem;
-    padding: 0.14rem 0.48rem;
-    border: 1px dashed color-mix(in srgb, var(--muted) 34%, var(--border-soft));
-    border-radius: 999px;
-    color: var(--muted);
-    font-size: 0.62rem;
-    font-weight: 650;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-  }
-
-  .ctx-separator {
-    height: 1px;
-    margin: 0.3rem 0.4rem;
-    background: color-mix(in srgb, var(--border-soft) 72%, transparent);
-  }
-
-  .ctx-item-danger {
-    color: var(--danger);
-  }
-
-  .ctx-item-danger:hover {
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-  }
-
-  .action-dialog {
-    width: min(29rem, 100%);
-    padding: clamp(1.35rem, 4vw, 2rem);
-    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-soft));
-    border-radius: 1.65rem;
-    background: color-mix(in srgb, var(--panel-elevated) 96%, transparent);
-    box-shadow: var(--shadow-float);
-    text-align: center;
-  }
-
-  .action-symbol {
-    display: grid;
-    place-items: center;
-    width: 3.5rem;
-    height: 3.5rem;
-    margin: 0 auto 1rem;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--accent) 16%, var(--elevated-soft));
-    color: var(--accent-2);
-    font: 500 1.5rem/1 Georgia, serif;
-    box-shadow: 0 0 0 0.5rem color-mix(in srgb, var(--accent) 5%, transparent);
-  }
-
-  .action-symbol-danger {
-    background: color-mix(in srgb, var(--danger) 13%, var(--elevated-soft));
-    color: var(--danger);
-    box-shadow: 0 0 0 0.5rem color-mix(in srgb, var(--danger) 4%, transparent);
-  }
-
-  .action-kicker {
-    margin: 0 0 0.55rem;
-    color: var(--accent-2);
-    font-size: 0.63rem;
-    font-weight: 750;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-  }
-
-  .action-dialog h2 {
-    margin: 0;
-    color: var(--text-soft);
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: clamp(1.45rem, 5vw, 1.9rem);
-    font-weight: 500;
-    letter-spacing: -0.035em;
-    line-height: 1.12;
-  }
-
-  .action-copy {
-    margin: 0.8rem auto 1rem;
-    max-width: 24rem;
-    color: var(--muted);
-    font-size: 0.82rem;
-    line-height: 1.55;
-  }
-
-  .action-book {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    padding: 0.75rem 0.85rem;
-    border: 1px solid color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-    border-radius: 0.95rem;
-    background: color-mix(in srgb, var(--panel-soft) 46%, transparent);
-    text-align: left;
-  }
-
-  .action-book strong {
-    color: var(--text-soft);
-    font-size: 0.82rem;
-    line-height: 1.35;
     overflow-wrap: anywhere;
   }
 
-  .action-book span {
-    overflow: hidden;
-    color: var(--muted);
-    font-family: ui-monospace, monospace;
-    font-size: 0.62rem;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .action-error {
-    margin: 0.8rem 0 0;
-    padding: 0.65rem 0.75rem;
-    border-radius: 0.8rem;
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-    color: var(--danger);
-    font-size: 0.74rem;
-    line-height: 1.4;
-  }
-
-  .action-buttons {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.55rem;
-    margin-top: 1.15rem;
-  }
-
-  .action-danger-button {
-    border-color: color-mix(in srgb, var(--danger) 42%, var(--border-soft));
-    background: var(--danger);
-    color: #fff;
-  }
-
-  .action-danger-button:hover {
-    border-color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 88%, #38111b);
-    color: #fff;
-  }
-
-  .action-buttons .home-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-    transform: none;
-  }
-
-  /* ——— Dreamcore interface skin ——— */
-  .home {
-    background: var(--bg-soft);
-  }
-
-  .home-ambient {
-    inset: 0;
-    opacity: 1;
-    background:
-      radial-gradient(circle at 84% 12%, color-mix(in srgb, #fff5c9 58%, transparent) 0 4.5rem, transparent 4.65rem),
-      radial-gradient(ellipse 34rem 18rem at 7% 5%, color-mix(in srgb, var(--accent) 26%, transparent), transparent 66%),
-      radial-gradient(ellipse 32rem 20rem at 100% 42%, color-mix(in srgb, #b8d7ef 24%, transparent), transparent 70%),
-      radial-gradient(ellipse 38rem 18rem at 48% 110%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 68%);
-  }
-
-  .home-ambient::before,
-  .home-ambient::after {
-    content: "";
-    position: absolute;
-    border-radius: 50%;
-    border: 1px solid color-mix(in srgb, var(--accent-2) 14%, transparent);
-  }
-
-  .home-ambient::before {
-    width: min(48vw, 36rem);
-    aspect-ratio: 1;
-    left: -18rem;
-    bottom: -23rem;
-  }
-
-  .home-ambient::after {
-    width: 11rem;
-    height: 11rem;
-    right: 7%;
-    top: 4rem;
-    box-shadow: 0 0 0 2.4rem color-mix(in srgb, var(--accent) 3%, transparent);
-  }
-
-  .home-film {
-    opacity: 0.18;
-    background-image:
-      radial-gradient(color-mix(in srgb, var(--accent-2) 11%, transparent) 0.7px, transparent 0.7px);
-    background-size: 28px 28px;
-    mix-blend-mode: normal;
-  }
-
-  .home-top {
-    min-height: 4.75rem;
-    padding: 0.9rem clamp(1rem, 4vw, 2rem);
-    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-    background: color-mix(in srgb, var(--panel-veil) 96%, var(--bg-soft));
-    backdrop-filter: none;
-    box-shadow: none;
-  }
-
-  .home-mark {
-    width: 2.45rem;
-    height: 2.45rem;
-    border-radius: 50%;
-    overflow: visible;
-    background: linear-gradient(145deg, #fff9dc, color-mix(in srgb, var(--accent) 56%, #fff));
-    box-shadow:
-      0 0 0 0.38rem color-mix(in srgb, var(--accent) 9%, transparent),
-      0 8px 25px color-mix(in srgb, var(--accent-2) 22%, transparent);
-  }
-
-  .home-mark::after {
-    inset: 0.54rem 0.38rem auto auto;
-    width: 0.8rem;
-    height: 0.8rem;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--accent-2) 22%, transparent);
-    opacity: 0.78;
-    transform: none;
-  }
-
-  .home-logo {
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: 1.45rem;
-    font-weight: 500;
-    letter-spacing: -0.045em;
-  }
-
-  .home-tagline {
-    font-size: 0.61rem;
-    letter-spacing: 0.13em;
-    font-weight: 650;
-  }
-
-  .home-btn {
-    min-height: 2.5rem;
-    padding: 0.52rem 0.95rem;
-    border-color: color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-    background: color-mix(in srgb, var(--elevated-soft) 92%, var(--panel-soft));
-    box-shadow: none;
-    backdrop-filter: none;
-  }
-
-  .home-btn-primary {
-    border-color: color-mix(in srgb, var(--accent-2) 28%, var(--border-soft));
-    background: var(--text-soft);
-    color: var(--panel-elevated);
-    box-shadow: 0 10px 28px color-mix(in srgb, var(--accent-2) 19%, transparent);
-  }
-
-  .home-btn-primary:hover {
-    color: var(--panel-elevated);
-    background: color-mix(in srgb, var(--text-soft) 90%, var(--accent-2));
-  }
-
-  :global([data-theme="dark"]) .home-btn-primary {
-    color: var(--bg-soft);
-    background: var(--text-soft);
-  }
-
-  .home-path {
-    padding-left: 3.25rem;
-    opacity: 0.72;
-  }
-
-  .home-main {
-    grid-template-columns: minmax(250px, 284px) 1fr;
-  }
-
-  .home-rail {
-    padding: 1.25rem 0 1.25rem 1.25rem;
-  }
-
-  .home-panel {
-    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-    border-radius: 1.5rem;
-    background: color-mix(in srgb, var(--panel-elevated) 92%, var(--bg-soft));
-    box-shadow: 0 16px 55px color-mix(in srgb, var(--accent-2) 7%, transparent);
-    backdrop-filter: none;
-  }
-
-  .home-panel-title {
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: 1.2rem;
-    font-weight: 500;
-  }
-
-  .shelf-pill {
-    min-height: 2.65rem;
-    border-radius: 1rem;
-    background: transparent;
-  }
-
-  .shelf-pill:hover {
-    transform: none;
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-
-  .shelf-pill-active {
-    border-color: color-mix(in srgb, var(--accent) 20%, var(--border-soft));
-    background: color-mix(in srgb, var(--accent) 14%, var(--elevated-soft));
-    box-shadow: none;
-  }
-
-  .add-shelf input,
-  .search-shell {
-    border-color: color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-    background: color-mix(in srgb, var(--elevated-soft) 72%, transparent);
-    box-shadow: none;
-    backdrop-filter: blur(12px);
-  }
-
-  .home-stage {
-    padding: clamp(1.2rem, 3vw, 2.35rem);
-  }
-
-  .home-stage::before {
-    background: transparent;
-  }
-
-  .stage-head {
-    margin-bottom: 1.9rem;
-    padding-bottom: 1.35rem;
-    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-  }
-
-  .stage-kicker,
-  .empty-kicker {
-    color: var(--accent-2);
-    font-size: 0.64rem;
-    letter-spacing: 0.22em;
-  }
-
-  .stage-title,
-  .empty-heading {
-    font-family: Georgia, "Times New Roman", serif;
-    font-weight: 500;
-    letter-spacing: -0.045em;
-  }
-
-  .stage-title {
-    font-size: clamp(2rem, 5vw, 2.7rem);
-    background: none;
-    color: var(--text-soft);
-  }
-
-  .book-grid {
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 11rem), 1fr));
-    gap: clamp(1rem, 2.5vw, 1.7rem);
-  }
-
-  .book-cell {
-    content-visibility: auto;
-    contain: layout paint style;
-    contain-intrinsic-size: auto 19rem;
-  }
-
-  .book-cell:nth-child(n) .book-card {
-    transform: none;
-  }
-
-  .book-card {
-    gap: 0.58rem;
-    padding: 0.65rem 0.65rem 0.85rem;
-    border-color: transparent;
-    border-radius: 1.35rem;
-    background: color-mix(in srgb, var(--panel-elevated) 88%, var(--bg-soft));
-    box-shadow: none;
-    backdrop-filter: none;
-  }
-
-  :global([data-theme="dark"]) .book-card {
-    box-shadow: none;
-  }
-
-  .book-card:hover {
-    transform: translateY(-5px);
-    border-color: color-mix(in srgb, var(--accent) 20%, transparent);
-    background: color-mix(in srgb, var(--panel-elevated) 88%, transparent);
-    box-shadow: var(--shadow-book);
-  }
-
-  .cover {
-    border-radius: 0.9rem 1.25rem 1.25rem 0.9rem;
-  }
-
-  .card-title {
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: 0.93rem;
-    line-height: 1.28;
-  }
-
-  .card-meta {
-    font-size: 0.63rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-
-  .ctx-menu {
-    padding: 0.5rem;
-    border-radius: 1.1rem;
-    border-color: color-mix(in srgb, var(--accent) 20%, var(--border-soft));
-    background: color-mix(in srgb, var(--panel-elevated) 92%, transparent);
-    backdrop-filter: blur(22px);
-  }
-
-  .ctx-item {
-    min-height: 2.5rem;
-    border-radius: 0.78rem;
-  }
-
-  /* ——— Dreamcore book editor ——— */
-  .modal-back {
-    padding: clamp(0.75rem, 3vw, 2rem);
-    background: color-mix(in srgb, #171226 52%, transparent);
-    backdrop-filter: blur(18px) saturate(0.9);
-  }
-
-  .modal.edit-modal {
-    display: grid;
-    grid-template-columns: minmax(12.5rem, 0.72fr) minmax(0, 1.8fr);
-    width: min(54rem, 100%);
-    max-height: min(92vh, 52rem);
-    overflow: hidden;
-    padding: 0;
-    border-radius: 1.75rem;
-    border-color: color-mix(in srgb, var(--accent) 24%, var(--border-soft));
-    background: color-mix(in srgb, var(--panel-elevated) 96%, transparent);
-    box-shadow:
-      0 32px 100px rgba(31, 21, 52, 0.34),
-      inset 0 1px 0 color-mix(in srgb, #fff 72%, transparent);
-  }
-
-  .edit-portrait {
-    position: relative;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-width: 0;
-    padding: 2.4rem 1.4rem 1.5rem;
-    text-align: center;
-    border-right: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-    background:
-      radial-gradient(circle at 50% 15%, color-mix(in srgb, var(--accent) 30%, transparent), transparent 38%),
-      linear-gradient(160deg, color-mix(in srgb, var(--panel-soft) 72%, var(--elevated-soft)), var(--bg-soft));
-  }
-
-  .edit-halo {
-    position: absolute;
-    width: 15rem;
-    height: 15rem;
-    top: -5.2rem;
-    left: 50%;
-    translate: -50% 0;
-    border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
-    border-radius: 50%;
-    box-shadow:
-      0 0 0 2.1rem color-mix(in srgb, var(--accent) 4%, transparent),
-      0 0 0 4.2rem color-mix(in srgb, var(--accent-2) 3%, transparent);
-  }
-
-  .edit-cover {
-    position: relative;
-    z-index: 1;
-    width: min(9.5rem, 72%);
-    aspect-ratio: 3 / 4;
-    overflow: hidden;
-    margin-bottom: 1.35rem;
-    border-radius: 0.9rem 1.35rem 1.35rem 0.9rem;
-    border: 1px solid color-mix(in srgb, var(--accent-2) 22%, var(--border-soft));
-    background: linear-gradient(145deg, #d9d0f3, #aebde8 54%, #d8e5ef);
-    box-shadow: 0 22px 45px color-mix(in srgb, var(--accent-2) 24%, transparent);
-  }
-
-  .edit-cover::after {
-    content: "";
-    position: absolute;
-    inset: 0 auto 0 0;
-    width: 0.45rem;
-    pointer-events: none;
-    background: linear-gradient(90deg, rgba(36, 24, 64, 0.28), transparent);
-  }
-
-  .edit-cover-mark {
-    color: #312847;
-    font-size: 0.67rem;
-    font-weight: 750;
-    letter-spacing: 0.18em;
-  }
-
-  .edit-portrait-kicker,
-  .edit-kicker {
-    margin: 0 0 0.5rem;
-    color: var(--accent-2);
-    font-size: 0.66rem;
-    font-weight: 750;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-  }
-
-  .edit-portrait-name {
-    margin: 0;
-    max-width: 100%;
-    color: var(--text-soft);
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: 1.15rem;
-    line-height: 1.18;
-    overflow-wrap: anywhere;
-  }
-
-  .edit-portrait-author {
-    margin: 0.4rem 0 0;
-    color: var(--muted);
-    font-size: 0.77rem;
-    line-height: 1.35;
-  }
-
-  .edit-form {
-    min-width: 0;
-    overflow-y: auto;
-    padding: 0 1.6rem 1.4rem;
-  }
-
-  .edit-form .modal-h {
-    align-items: flex-start;
-    gap: 1.2rem;
-    padding: 1.55rem 0 1.25rem;
-    background: color-mix(in srgb, var(--panel-elevated) 96%, transparent);
-    backdrop-filter: blur(14px);
-    z-index: 3;
-  }
-
-  .edit-form .modal-h h3 {
-    margin: 0;
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: clamp(1.45rem, 3vw, 1.85rem);
-    font-weight: 500;
-    letter-spacing: -0.035em;
-    line-height: 1.08;
-  }
-
-  .edit-subtitle {
-    max-width: 31rem;
-    margin: 0.55rem 0 0;
-    color: var(--muted);
+  .a {
     font-size: 0.82rem;
-    line-height: 1.45;
-  }
-
-  .edit-form .modal-x {
-    display: grid;
-    place-items: center;
-    flex: 0 0 auto;
-    width: 2.25rem;
-    height: 2.25rem;
-    padding: 0;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 84%, transparent);
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--elevated-soft) 88%, transparent);
-    font-size: 1.15rem;
-    transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
-  }
-
-  .edit-form .modal-x:hover {
-    background: color-mix(in srgb, var(--accent) 14%, var(--elevated-soft));
-    transform: rotate(4deg);
-  }
-
-  .edit-portrait .modal-path {
-    width: 100%;
-    margin: auto 0 0;
-    padding-top: 1.5rem;
-    font-family: ui-monospace, monospace;
-    font-size: 0.62rem;
-    opacity: 0.72;
+    color: var(--muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  .field-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.85rem;
-  }
-
-  .edit-group {
-    min-width: 0;
-    margin: 1.15rem 0 0;
-    padding: 0;
-    border: 0;
-  }
-
-  .edit-group legend,
-  .edit-form .field > span {
-    display: block;
-    margin: 0 0 0.48rem;
-    color: var(--text-soft);
-    font-size: 0.73rem;
-    font-weight: 700;
-    letter-spacing: 0.025em;
-  }
-
-  .importance-options {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 0.45rem;
-  }
-
-  .importance-option {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.4rem;
-    min-width: 0;
-    min-height: 2.5rem;
-    padding: 0.5rem 0.45rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 86%, transparent);
-    border-radius: 0.85rem;
-    background: color-mix(in srgb, var(--elevated-soft) 76%, transparent);
-    color: var(--muted);
-    cursor: pointer;
-    font-size: 0.72rem;
-    transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
-  }
-
-  .importance-option:hover {
-    transform: translateY(-1px);
-    border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
-  }
-
-  .importance-option-active {
-    border-color: color-mix(in srgb, var(--accent-2) 42%, var(--border-soft));
-    background: color-mix(in srgb, var(--accent) 14%, var(--elevated-soft));
-    color: var(--text-soft);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
-  }
-
-  .importance-dot {
-    width: 0.45rem;
-    height: 0.45rem;
-    flex: 0 0 auto;
-    border-radius: 50%;
-    background: #9f9aa8;
-  }
-
-  .importance-low { background: #9ebdb4; }
-  .importance-normal { background: #9c91c8; }
-  .importance-high { background: #d69a9f; }
-  .importance-essential { background: #c76478; }
-
-  .edit-form .field-hint {
-    margin: -0.15rem 0 0.6rem;
-    font-size: 0.7rem;
-    line-height: 1.4;
-  }
-
-  .edit-form .shelf-checks {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 0.45rem;
-  }
-
-  .edit-form .shelf-check {
-    display: inline-flex;
-    gap: 0.38rem;
-    min-height: 2.25rem;
-    padding: 0.4rem 0.7rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 82%, transparent);
+  .bar {
+    height: 3px;
     border-radius: 999px;
-    background: color-mix(in srgb, var(--elevated-soft) 72%, transparent);
-    font-size: 0.75rem;
-    color: var(--muted);
-    transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
-  }
-
-  .edit-form .shelf-check input {
-    position: absolute;
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  .shelf-check-mark {
-    display: grid;
-    place-items: center;
-    width: 1rem;
-    height: 1rem;
-    border-radius: 50%;
-    background: var(--panel-soft);
-    color: transparent;
-    font-size: 0.62rem;
-  }
-
-  .edit-form .shelf-check-active {
-    border-color: color-mix(in srgb, var(--accent-2) 38%, var(--border-soft));
-    background: color-mix(in srgb, var(--accent) 14%, var(--elevated-soft));
-    color: var(--text-soft);
-  }
-
-  .shelf-check-active .shelf-check-mark {
-    color: #fff;
-    background: var(--accent-2);
-  }
-
-  .edit-form .field {
-    gap: 0;
-    min-width: 0;
-    margin: 0;
-  }
-
-  .edit-form .field input,
-  .edit-form .field textarea {
-    display: block;
-    width: 100%;
-    min-width: 0;
-    padding: 0.72rem 0.8rem;
-    border-radius: 0.9rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 88%, transparent);
-    outline: none;
-    background: color-mix(in srgb, var(--elevated-soft) 88%, transparent);
-    color: var(--text-soft);
-    font-size: 0.85rem;
-    line-height: 1.35;
-    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 48%, transparent);
-    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
-  }
-
-  .edit-form .field input::placeholder,
-  .edit-form .field textarea::placeholder {
-    color: color-mix(in srgb, var(--muted) 76%, transparent);
-  }
-
-  .edit-form .field input:focus,
-  .edit-form .field textarea:focus {
-    border-color: color-mix(in srgb, var(--accent-2) 52%, var(--border-soft));
-    background: var(--elevated-soft);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
-  }
-
-  .edit-form .field textarea {
-    resize: vertical;
-    min-height: 6.6rem;
-    line-height: 1.55;
-  }
-
-  .edit-form .field small {
     margin-top: 0.35rem;
-    color: var(--muted);
-    font-size: 0.65rem;
-    line-height: 1.35;
+    background: color-mix(in srgb, var(--text-soft) 10%, transparent);
+    overflow: hidden;
   }
 
-  .field-notes {
-    margin-top: 1.15rem !important;
+  .bar span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
   }
 
-  .field-notes small {
-    align-self: flex-end;
-  }
-
-  .advanced-fields {
-    margin-top: 1rem;
-    border-top: 1px solid color-mix(in srgb, var(--border-soft) 72%, transparent);
-  }
-
-  .advanced-fields summary {
-    padding: 0.9rem 0;
-    color: var(--muted);
-    cursor: pointer;
-    font-size: 0.74rem;
-    font-weight: 650;
-    list-style: none;
-  }
-
-  .advanced-fields summary::-webkit-details-marker { display: none; }
-
-  .advanced-fields summary::after {
-    content: "+";
-    float: right;
-    font-size: 1rem;
-    font-weight: 400;
-  }
-
-  .advanced-fields[open] summary::after { content: "−"; }
-
-  .advanced-fields .field { padding-bottom: 0.35rem; }
-
-  .edit-form .modal-f {
-    align-items: center;
-    gap: 1rem;
-    margin-top: 1rem;
-    padding-top: 1rem;
-    border-top: 1px solid color-mix(in srgb, var(--border-soft) 72%, transparent);
-  }
-
-  .modal-f > p {
-    margin: 0 auto 0 0;
-    color: var(--muted);
-    font-size: 0.66rem;
-  }
-
-  .modal-actions {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  @media (max-width: 900px) {
-    .home-main {
-      grid-template-columns: 1fr;
-      grid-template-rows: minmax(0, 1fr);
-    }
-
-    .home-rail {
-      position: fixed;
-      inset: 0 auto 0 0;
-      z-index: 60;
-      width: min(88vw, 21rem);
-      min-height: 100dvh;
-      padding:
-        max(0.75rem, env(safe-area-inset-top))
-        0.75rem
-        max(0.75rem, env(safe-area-inset-bottom))
-        max(0.75rem, env(safe-area-inset-left));
-      background: color-mix(in srgb, var(--bg-soft) 92%, transparent);
-      backdrop-filter: blur(18px) saturate(1.15);
-      box-shadow: var(--shadow-float);
-      transform: translateX(-104%);
-      visibility: hidden;
-      transition: transform 0.24s cubic-bezier(0.33, 1, 0.68, 1), visibility 0.24s;
-    }
-
-    .home-rail-open {
-      transform: translateX(0);
-      visibility: visible;
-    }
-
-    .home-rail-inner {
-      overflow-y: auto;
-    }
-
-    .home-panel {
-      flex: 0 0 auto;
-    }
-
-    .home-panel:first-child {
-      flex: 1 0 auto;
-    }
-
-    .rail-close {
-      display: grid;
-      place-items: center;
-      width: 2.75rem;
-      height: 2.75rem;
-      border: 0;
-      border-radius: 999px;
-      background: var(--panel-soft);
-      color: var(--muted);
-      cursor: pointer;
-      font-size: 1.25rem;
-    }
-
-    .rail-backdrop {
-      position: fixed;
-      inset: 0;
-      z-index: 55;
-      border: 0;
-      background: color-mix(in srgb, #111 42%, transparent);
-      backdrop-filter: blur(3px);
-      opacity: 0;
-      visibility: hidden;
-      transition: opacity 0.2s ease, visibility 0.2s;
-    }
-
-    .rail-backdrop-open {
-      display: block;
-      opacity: 1;
-      visibility: visible;
-    }
-
-    .home-shelves-toggle {
-      display: inline-flex;
-    }
-
-    .home-panel-settings {
-      max-height: none;
-    }
-
-    .stage-tools {
-      width: 100%;
-      justify-content: stretch;
-    }
-
-  }
-
-  @media (max-width: 768px) {
-    .modal.edit-modal {
-      display: block;
-      overflow-y: auto;
-    }
-
-    .edit-portrait {
-      display: grid;
-      grid-template-columns: 4.5rem minmax(0, 1fr);
-      grid-template-rows: auto auto auto;
-      column-gap: 0.9rem;
-      min-height: 7.25rem;
-      padding: 1rem 3.8rem 1rem 1rem;
-      text-align: left;
-      border-right: 0;
-      border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-    }
-
-    .edit-halo {
-      width: 11rem;
-      height: 11rem;
-      top: -7.2rem;
-      left: auto;
-      right: -2rem;
-      translate: 0 0;
-    }
-
-    .edit-cover {
-      grid-row: 1 / 4;
-      width: 4.5rem;
-      margin: 0;
-      align-self: center;
-    }
-
-    .edit-portrait-kicker,
-    .edit-portrait-name,
-    .edit-portrait-author {
-      grid-column: 2;
-      align-self: end;
-    }
-
-    .edit-portrait-name { align-self: center; }
-    .edit-portrait-author { align-self: start; }
-    .edit-portrait .modal-path { display: none; }
-
-    .edit-form {
-      overflow: visible;
-      padding-inline: 1rem;
-    }
-
-    .home-top {
-      padding:
-        max(0.75rem, env(safe-area-inset-top))
-        max(clamp(0.85rem, 4vw, 1.35rem), env(safe-area-inset-right))
-        0.75rem
-        max(clamp(0.85rem, 4vw, 1.35rem), env(safe-area-inset-left));
-    }
-
-    .home-actions {
-      flex: 0 1 auto;
-      justify-content: flex-end;
-      margin-left: auto;
-    }
-
-    .home-actions .home-btn {
-      min-width: 2.75rem;
-      min-height: 2.75rem;
-      padding: 0.55rem 0.72rem;
-    }
-
-    .home-actions .action-label {
-      display: none;
-    }
-
-    .home-path {
-      order: 3;
-    }
-
-    .stage-head {
-      flex-direction: column;
-      align-items: stretch;
-    }
-
-    .book-grid {
-      grid-template-columns: repeat(auto-fill, minmax(min(100%, 8.75rem), 1fr));
-      gap: 1rem;
-    }
-
-    .book-card {
-      padding: 0.52rem 0.52rem 0.62rem;
-    }
-
-    .home-stage {
-      padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
-      overscroll-behavior: contain;
-    }
-
-    .card-menu-btn {
-      top: 0.78rem;
-      right: 0.78rem;
-      opacity: 1;
-      transform: none;
-      width: 2.75rem;
-      height: 2.75rem;
-    }
-
-    .book-cell:nth-child(n) .book-card {
-      transform: none;
-    }
-  }
-
-  @media (max-width: 420px) {
-    .action-dialog {
-      align-self: flex-end;
-      width: 100%;
-      border-radius: 1.55rem 1.55rem 0 0;
-    }
-
-    .action-buttons {
-      flex-direction: column-reverse;
-    }
-
-    .action-buttons .home-btn {
-      width: 100%;
-    }
-
-    .modal-back {
-      padding: 0;
-      align-items: flex-end;
-    }
-
-    .modal.edit-modal {
-      width: 100%;
-      max-height: 100dvh;
-      min-height: 100dvh;
-      border: 0;
-      border-radius: 0;
-      padding-bottom: env(safe-area-inset-bottom);
-    }
-
-    .field-grid { grid-template-columns: 1fr; }
-
-    .importance-options {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .edit-form .modal-h {
-      padding-top: 1.15rem;
-    }
-
-    .edit-form .modal-f {
-      align-items: stretch;
-      flex-direction: column;
-    }
-
-    .modal-f > p { display: none; }
-    .modal-actions { width: 100%; }
-    .modal-actions .home-btn { flex: 1; }
-
-    .home-tagline {
-      display: none;
-    }
-
-    .home-mark {
-      width: 2.2rem;
-      height: 2.2rem;
-    }
-
-    .home-logo {
-      font-size: 1.12rem;
-    }
-
-    .home-actions {
-      gap: 0.35rem;
-    }
-
-    .home-actions .home-btn {
-      width: 2.75rem;
-      min-width: 2.75rem;
-      min-height: 2.75rem;
-      padding: 0;
-    }
-
-    .home-actions .folder-label,
-    .home-shelves-toggle {
-      font-size: 0;
-      gap: 0;
-    }
-
-    .home-actions svg {
-      width: 1.08rem;
-      height: 1.08rem;
-    }
-
-    .stage-tools {
-      flex-direction: column;
-      align-items: stretch;
-    }
-
-    .search-shell,
-    .sort-shell {
-      flex-basis: auto;
-      width: 100%;
-    }
-
-    .book-grid {
-      gap: 0.85rem;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .card-title {
-      font-size: 0.8rem;
-      min-height: 2.8em;
-      -webkit-line-clamp: 2;
-      line-clamp: 2;
-    }
-  }
-
-  @media (max-width: 600px) {
-    .ctx-menu {
-      left: max(0.75rem, env(safe-area-inset-left)) !important;
-      right: max(0.75rem, env(safe-area-inset-right));
-      top: auto !important;
-      bottom: max(0.75rem, env(safe-area-inset-bottom));
-      width: auto;
-      min-width: 0;
-      max-height: min(70dvh, 28rem);
-      overflow-y: auto;
-      padding: 0.5rem;
-      border-radius: 1.25rem;
-    }
-
-    .ctx-item {
-      min-height: 2.75rem;
-      padding: 0.65rem 0.75rem;
-    }
-
-    .action-dialog {
-      padding-bottom: max(1.35rem, env(safe-area-inset-bottom));
-    }
-
-    .modal-actions .home-btn,
-    .action-buttons .home-btn {
-      min-height: 2.75rem;
-    }
-  }
-
-  @media (max-height: 520px) and (orientation: landscape) {
-    .home-top {
-      min-height: 0;
-      padding-top: max(0.45rem, env(safe-area-inset-top));
-      padding-bottom: 0.45rem;
-    }
-
-    .home-path,
-    .home-tagline {
-      display: none;
-    }
-
-    .empty-state {
-      margin-block: 1.5rem;
-    }
-  }
-
-  /* ——— Статусы, пыль, вид полки, перетаскивание ——— */
-  .status-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-    margin: -0.3rem 0 1.1rem;
-  }
-
-  .status-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 85%, transparent);
-    background: color-mix(in srgb, var(--panel-elevated) 70%, transparent);
-    color: var(--text-soft);
-    border-radius: 999px;
-    padding: 0.3rem 0.75rem;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: background 0.15s ease;
-  }
-
-  .status-chip span {
-    font-size: 0.7rem;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .status-chip.on {
-    background: var(--accent-2);
-    border-color: var(--accent-2);
-    color: var(--elevated-soft);
-  }
-
-  .status-chip.on span {
-    color: inherit;
-    opacity: 0.8;
-  }
-
-  .view-toggle {
-    display: flex;
-    padding: 3px;
-    border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--border-soft) 85%, transparent);
-    background: color-mix(in srgb, var(--panel-elevated) 70%, transparent);
-  }
-
-  .view-toggle button {
-    display: grid;
-    place-items: center;
-    width: 2.1rem;
-    height: 2rem;
-    border: none;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--muted);
-    cursor: pointer;
-  }
-
-  .view-toggle button.on {
-    background: var(--elevated-soft);
-    color: var(--accent-2);
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
-  }
-
-  .view-toggle svg {
-    width: 1.1rem;
-    height: 1.1rem;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.7;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-  }
-
-  .card-status {
+  .s {
     display: inline-flex;
     align-items: center;
     gap: 0.3rem;
-    width: fit-content;
-    font-size: 0.68rem;
-    font-weight: 600;
-    padding: 0.12rem 0.45rem;
-    border-radius: 999px;
+    font-size: 0.74rem;
     color: var(--muted);
-    background: color-mix(in srgb, var(--border-soft) 45%, transparent);
+    margin-top: 0.1rem;
   }
 
-  .card-status-reading {
+  .s-reading {
     color: var(--accent-2);
-    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    font-weight: 600;
   }
 
-  .card-status-done {
-    color: #4f7d5b;
-    background: color-mix(in srgb, #94d49a 30%, transparent);
+  .s-done {
+    color: #5f9a6e;
   }
 
-  .card-status-want {
-    color: #8a6a2e;
-    background: color-mix(in srgb, #f5d565 30%, transparent);
-  }
-
-  .card-important {
+  .star {
     color: #d49a2a;
   }
 
-  .book-card .cover {
-    position: relative;
-    filter: grayscale(calc(var(--dust, 0) * 0.8)) sepia(calc(var(--dust, 0) * 0.35))
-      brightness(calc(1 - var(--dust, 0) * 0.08));
-    transition: filter 0.7s ease;
-  }
-
-  .book-card .cover::after {
-    content: "";
+  .more {
     position: absolute;
-    inset: 0;
-    pointer-events: none;
-    border-radius: inherit;
-    opacity: calc(var(--dust, 0) * 0.85);
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='1.2' numOctaves='2'/><feColorMatrix values='0 0 0 0 0.86  0 0 0 0 0.83  0 0 0 0 0.78  0 0 0 0.6 0'/></filter><rect width='80' height='80' filter='url(%23n)'/></svg>");
-    transition: opacity 0.7s ease;
-  }
-
-  /* Наведение «сдувает пыль» */
-  .book-card:hover .cover {
-    filter: none;
-  }
-
-  .book-card:hover .cover::after {
-    opacity: 0;
-  }
-
-  .ctx-statuses {
+    top: 0.45rem;
+    right: 0.45rem;
+    z-index: 5;
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.25rem;
-    padding: 0.3rem 0.2rem;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    border: none;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel-elevated) 90%, transparent);
+    color: var(--text-soft);
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 12px rgba(20, 14, 30, 0.18);
+    cursor: pointer;
+    opacity: 0;
+    transform: scale(0.9);
+    transition:
+      opacity 0.15s ease,
+      transform 0.15s ease;
   }
 
-  .ctx-status {
+  .cell:hover .more,
+  .more:focus-visible {
+    opacity: 1;
+    transform: none;
+  }
+
+  .empty {
+    padding: 4rem 1rem;
+    text-align: center;
+    color: var(--muted);
+  }
+
+  .empty-title {
+    margin: 0 0 0.4rem;
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: 1.35rem;
+    color: var(--text-soft);
+  }
+
+  .empty p {
+    margin: 0 0 0.3rem;
+  }
+
+  .ghost,
+  .solid {
+    margin-top: 0.8rem;
+    padding: 0.55rem 1.1rem;
+    border-radius: 999px;
     border: 1px solid var(--border-soft);
     background: transparent;
     color: var(--text-soft);
-    border-radius: 8px;
-    padding: 0.3rem 0.4rem;
-    font-size: 0.72rem;
+    font: inherit;
     cursor: pointer;
   }
 
-  .ctx-status.on,
-  .ctx-status:hover {
-    border-color: var(--accent-2);
-    color: var(--accent-2);
+  .solid {
+    background: var(--text-soft);
+    border-color: var(--text-soft);
+    color: var(--bg-soft);
+    font-weight: 600;
   }
 
-  .drop-overlay {
+  .solid.danger {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+  }
+
+  /* ——— Перетаскивание ——— */
+  .drop {
     position: fixed;
     inset: 0;
     z-index: 1500;
     display: grid;
     place-items: center;
-    background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
-    backdrop-filter: blur(6px);
-    animation: fade-in 0.15s ease-out;
+    background: color-mix(in srgb, var(--bg-soft) 72%, transparent);
+    backdrop-filter: blur(8px);
+    animation: fade 0.15s ease-out;
   }
 
   .drop-card {
@@ -3727,32 +1370,259 @@
     flex-direction: column;
     align-items: center;
     gap: 0.4rem;
-    padding: 2.2rem 3rem;
-    border-radius: var(--radius-xl);
+    padding: 2.6rem 3.4rem;
+    border-radius: 2rem;
     border: 2px dashed var(--accent-2);
     background: var(--panel-elevated);
     box-shadow: var(--shadow-float);
-    text-align: center;
   }
 
-  .drop-icon {
-    font-size: 2.4rem;
-    color: var(--accent-2);
+  .drop-card svg {
+    width: 2.6rem;
+    height: 2.6rem;
+    fill: none;
+    stroke: var(--accent-2);
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    animation: bob 1.6s ease-in-out infinite;
   }
 
   .drop-card p {
-    margin: 0;
-    font-size: 1.05rem;
-    font-weight: 600;
+    margin: 0.4rem 0 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: 1.25rem;
   }
 
   .drop-card small {
     color: var(--muted);
   }
 
-  @keyframes fade-in {
+  /* ——— Контекстное меню ——— */
+  .ctx {
+    position: fixed;
+    z-index: 800;
+    width: 15rem;
+    padding: 0.4rem;
+    border-radius: 1rem;
+    background: var(--panel-elevated);
+    border: 1px solid color-mix(in srgb, var(--border-soft) 80%, transparent);
+    box-shadow: var(--shadow-float);
+    display: flex;
+    flex-direction: column;
+    animation: pop 0.14s ease-out;
+  }
+
+  .ctx-title {
+    margin: 0;
+    padding: 0.45rem 0.7rem 0.5rem;
+    font-family: "Literata Variable", Georgia, serif;
+    font-weight: 600;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ctx-label {
+    margin: 0;
+    padding: 0.2rem 0.7rem;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+  }
+
+  .ctx > button {
+    border: none;
+    background: transparent;
+    color: var(--text-soft);
+    text-align: left;
+    padding: 0.5rem 0.7rem;
+    border-radius: 0.6rem;
+    font: inherit;
+    font-size: 0.88rem;
+    cursor: pointer;
+  }
+
+  .ctx > button:hover {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
+  .ctx > button.danger {
+    color: var(--danger);
+  }
+
+  .ctx-status {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.25rem;
+    padding: 0.2rem 0.4rem 0.3rem;
+  }
+
+  .ctx-status button {
+    border: 1px solid var(--border-soft);
+    background: transparent;
+    color: var(--text-soft);
+    border-radius: 0.55rem;
+    padding: 0.35rem 0.3rem;
+    font: inherit;
+    font-size: 0.74rem;
+    cursor: pointer;
+  }
+
+  .ctx-status button.on {
+    background: var(--text-soft);
+    border-color: var(--text-soft);
+    color: var(--bg-soft);
+  }
+
+  .sep {
+    height: 1px;
+    margin: 0.3rem 0.5rem;
+    background: color-mix(in srgb, var(--border-soft) 80%, transparent);
+  }
+
+  /* ——— Подтверждение ——— */
+  .confirm-back {
+    position: fixed;
+    inset: 0;
+    z-index: 900;
+    display: grid;
+    place-items: center;
+    padding: 1rem;
+    background: rgba(20, 14, 30, 0.38);
+    backdrop-filter: blur(6px);
+    animation: fade 0.18s ease-out;
+  }
+
+  .confirm {
+    width: min(30rem, 100%);
+    display: flex;
+    gap: 1.4rem;
+    padding: 1.6rem;
+    border-radius: 1.5rem;
+    background: var(--panel-elevated);
+    box-shadow: var(--shadow-float);
+    animation: pop 0.18s ease-out;
+  }
+
+  .confirm-book {
+    width: 5.2rem;
+    flex-shrink: 0;
+  }
+
+  .confirm-body h2 {
+    margin: 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-weight: 500;
+    font-size: 1.3rem;
+  }
+
+  .confirm-name {
+    margin: 0.4rem 0 0;
+    font-weight: 600;
+  }
+
+  .confirm-copy {
+    margin: 0.5rem 0 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+
+  .confirm-error {
+    margin: 0.6rem 0 0;
+    color: var(--danger);
+    font-size: 0.86rem;
+  }
+
+  .confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  @keyframes fade {
     from {
       opacity: 0;
+    }
+  }
+
+  @keyframes pop {
+    from {
+      opacity: 0;
+      transform: translateY(-4px) scale(0.98);
+    }
+  }
+
+  @media (max-width: 900px) {
+    .menu-btn {
+      display: grid;
+    }
+  }
+
+  @media (max-width: 600px) {
+    .main {
+      padding: 0 1rem 3rem;
+    }
+
+    .topbar {
+      padding-inline: 1rem;
+      margin-inline: -1rem;
+    }
+
+    .add span {
+      display: none;
+    }
+
+    .add {
+      padding: 0.62rem;
+    }
+
+    .search kbd {
+      display: none;
+    }
+
+    .search {
+      flex: 1;
+      width: auto;
+      min-width: 0;
+    }
+
+    .topbar .grow,
+    .refresh-btn {
+      display: none;
+    }
+
+    .grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 2rem 1.2rem;
+    }
+
+    .more {
+      opacity: 1;
+      transform: none;
+      width: 1.8rem;
+      height: 1.8rem;
+    }
+
+    .sort {
+      min-width: 0;
+    }
+
+    .library {
+      margin-top: 2.2rem;
     }
   }
 </style>
