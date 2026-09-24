@@ -34,6 +34,11 @@
   import ReaderSearchPanel from "$lib/components/ReaderSearchPanel.svelte";
   import ReaderStatusBar from "$lib/components/ReaderStatusBar.svelte";
   import ReadingRuler from "$lib/components/ReadingRuler.svelte";
+  import TtsBar from "$lib/components/TtsBar.svelte";
+  import RsvpOverlay from "$lib/components/RsvpOverlay.svelte";
+  import AmbientPanel from "$lib/components/AmbientPanel.svelte";
+  import { startReading, stopReading, tts } from "$lib/reading/tts.svelte";
+  import { AMBIENT_OPTIONS, ambient, playAmbient, stopAmbient, type AmbientId } from "$lib/reading/ambient.svelte";
   import { getBookFormat } from "$lib/bookFormat";
   import { loadPdfBookTranslationFile } from "$lib/translate/pdfFullBookJob";
   import { exportTranslatedPdfToLibrary } from "$lib/pdf/exportTranslatedPdf";
@@ -103,6 +108,8 @@
   let searchSeed = $state("");
   let stageEl = $state<HTMLElement | null>(null);
   let isFullscreen = $state(false);
+  let rsvpOpen = $state(false);
+  let ambientOpen = $state(false);
 
   // ——— Выделение и заметки ———
   let selection = $state<ReaderSelection | null>(null);
@@ -664,6 +671,47 @@
     }
   }
 
+  function toggleTts() {
+    moreOpen = false;
+    if (tts.active) {
+      stopReading();
+      return;
+    }
+    if (!navApi?.unitsFromHere) {
+      toast("Для этого формата чтение вслух недоступно", "info");
+      return;
+    }
+    void startReading(navApi);
+  }
+
+  function openRsvp() {
+    moreOpen = false;
+    if (!navApi?.unitsFromHere) {
+      toast("Для этого формата быстрое чтение недоступно", "info");
+      return;
+    }
+    stopReading();
+    rsvpOpen = true;
+  }
+
+  function bindAmbient(id: AmbientId | null) {
+    if (bookPath) patchBook(bookPath, { ambientSound: id });
+  }
+
+  // Книга «помнит» свой звук: предлагаем включить (автозапуск звука запрещён без жеста).
+  let offeredAmbientFor = "";
+  $effect(() => {
+    const p = bookPath;
+    const id = meta?.ambientSound as AmbientId | null | undefined;
+    if (!p || !id || offeredAmbientFor === p || ambient.current === id) return;
+    offeredAmbientFor = p;
+    const label = AMBIENT_OPTIONS.find((o) => o.id === id)?.label ?? id;
+    toast(`У этой книги есть свой звук: «${label}»`, "info", {
+      action: { label: "Включить", run: () => void playAmbient(id) },
+      timeout: 9000,
+    });
+  });
+
   function onCenterTap() {
     if (selection) return;
     toggleImmersive();
@@ -690,6 +738,7 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    if (rsvpOpen) return;
     if (typing(e.target)) {
       if (e.key === "Escape") (e.target as HTMLElement).blur();
       return;
@@ -731,6 +780,7 @@
         break;
       case "Escape":
         if (hlPopover) hlPopover = null;
+        else if (ambientOpen) ambientOpen = false;
         else if (aaOpen) aaOpen = false;
         else if (moreOpen) moreOpen = false;
         else if (selection) {
@@ -762,6 +812,14 @@
       case "a":
       case "ф":
         aaOpen = !aaOpen;
+        break;
+      case "s":
+      case "ы":
+        if (fmt !== "typst") toggleTts();
+        break;
+      case "r":
+      case "к":
+        if (fmt !== "typst") openRsvp();
         break;
     }
   }
@@ -825,7 +883,14 @@
     return () => document.removeEventListener("visibilitychange", onVis);
   });
 
+  $effect(() => {
+    bookPath;
+    return () => stopReading();
+  });
+
   onDestroy(() => {
+    stopReading();
+    stopAmbient();
     if (saveTimer) clearTimeout(saveTimer);
     if (locSaveTimer) clearTimeout(locSaveTimer);
     if (pdfProgTimer) clearTimeout(pdfProgTimer);
@@ -932,6 +997,23 @@
                   }}>Перевод книги…</button
                 >
               {/if}
+              {#if fmt !== "typst"}
+                <button type="button" role="menuitem" onclick={toggleTts}>
+                  {tts.active ? "Остановить чтение вслух" : "Читать вслух"} <kbd>S</kbd>
+                </button>
+                <button type="button" role="menuitem" onclick={openRsvp}>Быстрое чтение (RSVP) <kbd>R</kbd></button>
+              {/if}
+              <button
+                type="button"
+                role="menuitem"
+                onclick={() => {
+                  moreOpen = false;
+                  ambientOpen = true;
+                }}
+              >
+                Фоновый звук… {#if ambient.current}<kbd>♪ {AMBIENT_OPTIONS.find((o) => o.id === ambient.current)?.label}</kbd>{/if}
+              </button>
+              <div class="menu-sep"></div>
               <button type="button" role="menuitem" onclick={() => void toggleFullscreen()}>
                 {isFullscreen ? "Выйти из полного экрана" : "Во весь экран"} <kbd>F11</kbd>
               </button>
@@ -1175,6 +1257,16 @@
       }}
       onClose={() => (hlPopover = null)}
     />
+  {/if}
+
+  <TtsBar />
+
+  {#if rsvpOpen && navApi}
+    <RsvpOverlay api={navApi} {palette} onClose={() => (rsvpOpen = false)} />
+  {/if}
+
+  {#if ambientOpen}
+    <AmbientPanel bookSound={meta?.ambientSound ?? null} onBind={bindAmbient} onClose={() => (ambientOpen = false)} />
   {/if}
 
   <CommentDialog

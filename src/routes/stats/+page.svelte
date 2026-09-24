@@ -46,6 +46,8 @@
     grid.forEach((col, i) => {
       const m = Number(col[0]!.key.slice(5, 7));
       if (m !== last) {
+        // Первая неполная неделя месяца не должна наезжать на соседнюю подпись.
+        if (out.length && i - out[out.length - 1]!.idx < 3) out.pop();
         out.push({ idx: i, label: new Date(2000, m - 1, 1).toLocaleDateString("ru", { month: "short" }) });
         last = m;
       }
