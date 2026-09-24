@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { LibrarySnapshot } from "$lib/types";
-import { parseFb2 } from "$lib/fb2/parseFb2";
+import { decodeFb2Bytes, parseFb2 } from "$lib/fb2/parseFb2";
 import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
 import { BUILTIN_MINIMAL_THEME } from "./defaultTheme";
 import { htmlFragmentToTypst } from "./htmlToTypst";
@@ -103,7 +103,7 @@ export async function exportBookToTypst(
   const assetIdx = { i: 0 };
 
   if (format === "fb2") {
-    const xml = new TextDecoder("utf-8").decode(bytes);
+    const xml = decodeFb2Bytes(bytes);
     const parsed = parseFb2(xml);
     title = parsed.bookTitle || "";
     author = parsed.author || "";

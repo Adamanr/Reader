@@ -1,30 +1,44 @@
 <script lang="ts">
-  import type { EpubReaderApi, QuoteDraftOptions } from "$lib/types";
-  import { parseFb2, type Fb2Section } from "$lib/fb2/parseFb2";
-  import { writeTextToClipboard } from "$lib/clipboardWrite";
-  import ReaderSelectionToolbar from "$lib/components/ReaderSelectionToolbar.svelte";
-  import CommentDialog from "$lib/components/CommentDialog.svelte";
-  import QuoteDialog from "$lib/components/QuoteDialog.svelte";
+  import { tick, untrack } from "svelte";
+  import type {
+    EpubReaderApi,
+    Highlight,
+    ReaderSelection,
+    ReadingPosition,
+    ReadingUnit,
+    SearchHit,
+    TextChunk,
+  } from "$lib/types";
+  import { decodeFb2Bytes, parseFb2, type Fb2Section } from "$lib/fb2/parseFb2";
   import { extractTextNodesHtml } from "$lib/translate/htmlText";
   import { translateStringList } from "$lib/translate/translateApi";
   import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
+  import { ensureAppFonts } from "$lib/reading/fonts";
+  import { typographyVars, varsToStyle } from "$lib/reading/contentCss";
+  import type { PagePalette } from "$lib/reading/palette";
+  import { reading } from "$lib/reading/settings.svelte";
+  import {
+    excerptAround,
+    findAll,
+    locateText,
+    offsetOfPoint,
+    rangeFromOffsets,
+    unwrapAll,
+    wrapRange,
+  } from "$lib/reading/textAnchor";
 
   interface Props {
     relativePath: string;
-    variant?: "full" | "reader";
-    /** Формат `#anchor` как в spine FB2. */
+    /** `b:<номер абзаца>` или устаревший `#anchor` секции. */
     initialLocation?: string;
-    onReadingProgress?: (p: { location: string; label: string }) => void;
+    palette: PagePalette;
+    highlights?: Highlight[];
+    onReadingProgress?: (p: { location: string; label: string; href: string; progress: number | null }) => void;
+    onPosition?: (p: ReadingPosition) => void;
     onReaderApi?: (api: EpubReaderApi | null) => void;
-    displayTitle?: string;
-    displayAuthor?: string;
-    onAddComment?: (c: {
-      body: string;
-      excerpt: string;
-      page?: number;
-      chapterLabel?: string;
-    }) => void;
-    onAddQuote?: (q: { text: string; options: QuoteDraftOptions }) => void;
+    onSelection?: (s: ReaderSelection | null) => void;
+    onHighlightClick?: (id: string, rect: DOMRect) => void;
+    onCenterTap?: () => void;
     translateRunKey?: number;
     translateSource?: string;
     translateTarget?: string;
@@ -33,20 +47,23 @@
   }
   let {
     relativePath,
-    variant = "full",
     initialLocation = "",
+    palette,
+    highlights = [],
     onReadingProgress,
+    onPosition,
     onReaderApi,
-    displayTitle = "",
-    displayAuthor = "",
-    onAddComment,
-    onAddQuote,
+    onSelection,
+    onHighlightClick,
+    onCenterTap,
     translateRunKey = 0,
     translateSource = "auto",
     translateTarget = "ru",
     translateLayout = "orig",
     onTranslateActivity,
   }: Props = $props();
+
+  const BLOCK_SEL = ".fb2-section :is(p, h2, h3, .fb2-v)";
 
   let scrollRoot = $state<HTMLDivElement | null>(null);
   let loading = $state(true);
@@ -56,20 +73,28 @@
   /** Переведённые секции (после «Перевести книгу»). */
   let sectionsTr = $state<Fb2Section[] | null>(null);
   let processedTranslateKey = $state(0);
-  let relocatedLabel = $state("");
-  let activeIdx = $state(0);
-  let lastReportedLocation = "";
-
-  let toolbarVisible = $state(false);
-  let toolbarX = $state(0);
-  let toolbarY = $state(0);
-  let selectedText = $state("");
-  let commentOpen = $state(false);
-  let quoteOpen = $state(false);
-
   let session = 0;
 
-  const interactionsEnabled = $derived(!!(onAddComment && onAddQuote));
+  /** Абзацы в порядке чтения и накопленная длина текста до каждого. */
+  let blocks: HTMLElement[] = [];
+  let cumChars: number[] = [];
+  let totalChars = 0;
+  let blockSection: number[] = [];
+  let sectionEndChars: number[] = [];
+  let articles: HTMLElement[] = [];
+  let currentBlock = 0;
+  let restored = false;
+
+  ensureAppFonts();
+
+  function sectionHref(i: number) {
+    return `#${sections[i]?.anchor ?? ""}`;
+  }
+
+  function scrollToBlock(i: number, smooth = false) {
+    const el = blocks[Math.max(0, Math.min(blocks.length - 1, i))];
+    el?.scrollIntoView({ block: "start", behavior: smooth ? "smooth" : "auto" });
+  }
 
   function buildApi(list: Fb2Section[]): EpubReaderApi {
     const nav = list.map((s) => ({
@@ -82,38 +107,45 @@
       spine: nav,
       goTo: async (href: string) => {
         const id = href.replace(/^#/, "");
-        document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+        scrollRoot?.querySelector(`#${CSS.escape(id)}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
       },
-      prev: async () => {
-        const idx = Math.max(0, activeIdx - 1);
-        const s = list[idx];
-        if (s) document.getElementById(s.anchor)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      prev: async () => pageBy(-1),
+      next: async () => pageBy(1),
+      seek: async (f: number) => {
+        const r = scrollRoot;
+        if (!r) return;
+        const target = cumChars.findIndex((c) => c >= f * totalChars);
+        if (target >= 0) scrollToBlock(target);
+        else r.scrollTop = r.scrollHeight;
       },
-      next: async () => {
-        const idx = Math.min(list.length - 1, activeIdx + 1);
-        const s = list[idx];
-        if (s) document.getElementById(s.anchor)?.scrollIntoView({ behavior: "smooth", block: "start" });
-      },
+      search,
+      goToHit,
+      unitsFromHere,
+      advanceChapter,
+      chunksBefore,
     };
+  }
+
+  function pageBy(dir: number) {
+    const r = scrollRoot;
+    if (!r) return;
+    r.scrollBy({ top: dir * r.clientHeight * 0.9, behavior: "smooth" });
   }
 
   async function loadBook(path: string, sid: number) {
     loading = true;
     err = null;
     sections = [];
-    relocatedLabel = "";
-    lastReportedLocation = "";
+    restored = false;
     onReaderApi?.(null);
     try {
       const bytes = await readLibraryBookBytes(path);
       if (sid !== session) return;
-      const xml = new TextDecoder("utf-8").decode(bytes);
-      const parsed = parseFb2(xml);
+      const parsed = parseFb2(decodeFb2Bytes(bytes));
       if (sid !== session) return;
       coverHtml = parsed.coverHtml ?? "";
       sections = parsed.sections;
       sectionsTr = null;
-      relocatedLabel = parsed.sections[0]?.title ?? "";
       onReaderApi?.(buildApi(parsed.sections));
     } catch (e) {
       if (sid === session) err = String(e);
@@ -174,144 +206,354 @@
     void runFullTranslate();
   });
 
+  /** Пересобираем карту абзацев после каждой перерисовки текста. */
+  function indexBlocks() {
+    const root = scrollRoot;
+    if (!root) return;
+    articles = Array.from(root.querySelectorAll<HTMLElement>("article.fb2-section"));
+    blocks = Array.from(root.querySelectorAll<HTMLElement>(BLOCK_SEL)).filter(
+      (el) => !el.parentElement?.closest(":is(p, h2, h3, .fb2-v)"),
+    );
+    cumChars = [];
+    blockSection = [];
+    sectionEndChars = new Array(articles.length).fill(0);
+    let acc = 0;
+    for (const el of blocks) {
+      cumChars.push(acc);
+      acc += (el.textContent ?? "").length;
+      const art = el.closest("article.fb2-section") as HTMLElement | null;
+      const si = art ? articles.indexOf(art) : -1;
+      blockSection.push(si);
+      if (si >= 0) sectionEndChars[si] = acc;
+    }
+    totalChars = acc || 1;
+  }
+
+  function firstVisibleBlock(): number {
+    const root = scrollRoot;
+    if (!root || blocks.length === 0) return 0;
+    const top = root.getBoundingClientRect().top + 6;
+    let lo = 0;
+    let hi = blocks.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (blocks[mid]!.getBoundingClientRect().bottom <= top) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  function blockAtLine(fraction: number): number {
+    const root = scrollRoot;
+    if (!root || blocks.length === 0) return 0;
+    const rr = root.getBoundingClientRect();
+    const y = rr.top + rr.height * fraction;
+    let lo = 0;
+    let hi = blocks.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (blocks[mid]!.getBoundingClientRect().bottom < y) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  function emitPosition() {
+    if (blocks.length === 0) return;
+    const i = firstVisibleBlock();
+    currentBlock = i;
+    const root = scrollRoot!;
+    const atEnd = root.scrollTop + root.clientHeight >= root.scrollHeight - 4;
+    const si = blockSection[i] ?? -1;
+    const sec = sections[si];
+    const read = cumChars[i] ?? 0;
+    const progress = atEnd ? 1 : read / totalChars;
+    onPosition?.({
+      progress,
+      chapterLabel: sec?.title ?? "",
+      charsLeftChapter: si >= 0 ? Math.max(0, (sectionEndChars[si] ?? read) - read) : null,
+      charsLeftBook: Math.max(0, totalChars - read),
+    });
+    if (restored) {
+      onReadingProgress?.({
+        location: `b:${i}`,
+        label: sec?.title ?? "",
+        href: si >= 0 ? sectionHref(si) : "",
+        progress,
+      });
+    }
+    if (reading.s.focus === "paragraph") setFocusBlock(blockAtLine(0.38));
+  }
+
+  function setFocusBlock(i: number) {
+    const root = scrollRoot;
+    if (!root) return;
+    for (const el of Array.from(root.querySelectorAll(".rd-focus-current"))) el.classList.remove("rd-focus-current");
+    blocks[i]?.classList.add("rd-focus-current");
+  }
+
+  let scrollRaf = 0;
+  function onScroll() {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      emitPosition();
+    });
+  }
+
+  /** После отрисовки: индекс абзацев, восстановление позиции, выделения. */
   $effect(() => {
     const root = scrollRoot;
     const secs = sections;
+    translateLayout;
+    sectionsTr;
     if (!root || secs.length === 0) return;
-
-    const obs = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
-        const top = visible[0];
-        if (!top?.target.id) return;
-        const ix = secs.findIndex((s) => s.anchor === top.target.id);
-        if (ix >= 0) {
-          activeIdx = ix;
-          relocatedLabel = secs[ix].title;
-          const s = secs[ix];
-          lastReportedLocation = `#${s.anchor}`;
-          onReadingProgress?.({ location: lastReportedLocation, label: s.title });
+    void tick().then(() => {
+      indexBlocks();
+      paintHighlights();
+      if (!restored) {
+        const loc = untrack(() => initialLocation?.trim() ?? "");
+        if (loc.startsWith("b:")) {
+          scrollToBlock(Number(loc.slice(2)) || 0);
+        } else if (loc.startsWith("#")) {
+          root.querySelector(`#${CSS.escape(loc.slice(1))}`)?.scrollIntoView({ block: "start" });
         }
-      },
-      { root, rootMargin: "-12% 0px -60% 0px", threshold: [0, 0.1, 0.25] },
-    );
-
-    const t = window.setTimeout(() => {
-      for (const s of secs) {
-        const el = document.getElementById(s.anchor);
-        if (el) obs.observe(el);
+        restored = true;
       }
-    }, 0);
-
-    return () => {
-      window.clearTimeout(t);
-      obs.disconnect();
-    };
+      emitPosition();
+    });
   });
 
-  /** Восстановление якоря после загрузки секций */
+  /** Типографика меняет высоту текста — возвращаемся к тому же абзацу. */
   $effect(() => {
-    const loc = initialLocation?.trim() ?? "";
-    const secs = sections;
-    // Сохранённый прогресс возвращается сюда через props. Не прокручиваем к
-    // началу секции повторно после обычного движения колёсиком.
-    if (!loc || loc === lastReportedLocation || secs.length === 0) return;
-    const id = loc.replace(/^#/, "");
-    const t = window.setTimeout(() => {
-      document.getElementById(id)?.scrollIntoView({ block: "start" });
-    }, 80);
-    return () => window.clearTimeout(t);
+    reading.s.fontSize;
+    reading.s.lineHeight;
+    reading.s.measure;
+    reading.s.font;
+    reading.s.paraSpacing;
+    reading.s.letterSpacing;
+    reading.s.wordSpacing;
+    const keep = untrack(() => currentBlock);
+    if (!untrack(() => restored)) return;
+    void tick().then(() => scrollToBlock(keep));
   });
 
-  function refreshToolbar() {
-    if (!interactionsEnabled || loading || err) {
-      toolbarVisible = false;
-      return;
+  $effect(() => {
+    if (reading.s.focus === "paragraph" && scrollRoot) setFocusBlock(blockAtLine(0.38));
+  });
+
+  function paintHighlights() {
+    const root = scrollRoot;
+    if (!root) return;
+    unwrapAll(root, "mark.rd-hl");
+    if (translateLayout !== "orig") return;
+    for (const h of highlights) {
+      if (h.block == null) continue;
+      const art = articles[h.block];
+      if (!art) continue;
+      const loc = locateText(art, h.text, h.offset ?? 0);
+      if (!loc) continue;
+      const range = rangeFromOffsets(art, loc.start, loc.end);
+      if (!range) continue;
+      wrapRange(range, () => {
+        const m = document.createElement("mark");
+        m.className = `rd-hl rd-hl-${h.color}${h.note ? " rd-hl-note" : ""}`;
+        m.dataset.id = h.id;
+        return m;
+      });
     }
+  }
+
+  $effect(() => {
+    highlights;
+    untrack(() => {
+      if (blocks.length) paintHighlights();
+    });
+  });
+
+  function refreshSelection() {
+    const root = scrollRoot;
+    if (!root || loading || err) return;
     const sel = document.getSelection();
-    if (!sel || sel.isCollapsed || !scrollRoot) {
-      toolbarVisible = false;
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !root.contains(sel.anchorNode)) {
+      onSelection?.(null);
       return;
     }
-    const t = sel.toString().trim();
-    if (!t) {
-      toolbarVisible = false;
+    const text = sel.toString().trim();
+    if (!text) {
+      onSelection?.(null);
       return;
     }
-    if (!scrollRoot.contains(sel.anchorNode)) {
-      toolbarVisible = false;
-      return;
-    }
-    selectedText = t;
     const range = sel.getRangeAt(0);
     const rect = range.getBoundingClientRect();
-    toolbarX = rect.left + rect.width / 2;
-    toolbarY = rect.top;
-    toolbarVisible = true;
+    const startEl =
+      range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as Element)
+        : range.startContainer.parentElement;
+    const art = startEl?.closest("article.fb2-section") as HTMLElement | null;
+    const block = art ? articles.indexOf(art) : -1;
+    const offset = art ? offsetOfPoint(art, range.startContainer, range.startOffset) : null;
+    onSelection?.({
+      text,
+      rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      anchor: {
+        block: block >= 0 ? block : undefined,
+        offset: offset ?? undefined,
+        chapterLabel: block >= 0 ? sections[block]?.title : undefined,
+      },
+      clear: () => document.getSelection()?.removeAllRanges(),
+    });
   }
 
   $effect(() => {
-    document.addEventListener("selectionchange", refreshToolbar);
-    document.addEventListener("mouseup", refreshToolbar);
+    const onUp = () => requestAnimationFrame(refreshSelection);
+    document.addEventListener("mouseup", onUp);
+    document.addEventListener("keyup", onUp);
+    document.addEventListener("touchend", onUp);
     return () => {
-      document.removeEventListener("selectionchange", refreshToolbar);
-      document.removeEventListener("mouseup", refreshToolbar);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("keyup", onUp);
+      document.removeEventListener("touchend", onUp);
     };
   });
 
-  async function doCopy() {
-    const t = selectedText.trim();
-    if (!t) return;
-    try {
-      await writeTextToClipboard(t);
-    } catch {
-      /* ignore */
+  function onRootClick(e: MouseEvent) {
+    const sel = document.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    const target = e.target as Element;
+    const mark = target.closest("mark.rd-hl") as HTMLElement | null;
+    if (mark?.dataset.id) {
+      onHighlightClick?.(mark.dataset.id, mark.getBoundingClientRect());
+      return;
     }
-    toolbarVisible = false;
-    document.getSelection()?.removeAllRanges();
+    if (target.closest("a, button, img")) return;
+    const r = scrollRoot!.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width;
+    if (reading.s.tapZones && x < 0.22) pageBy(-1);
+    else if (reading.s.tapZones && x > 0.78) pageBy(1);
+    else onCenterTap?.();
   }
 
-  function openComment() {
-    if (!selectedText.trim()) return;
-    commentOpen = true;
-    toolbarVisible = false;
+  function onRootMouseMove(e: MouseEvent) {
+    if (reading.s.focus !== "paragraph") return;
+    const el = (e.target as Element).closest(":is(p, h2, h3, .fb2-v)") as HTMLElement | null;
+    const i = el ? blocks.indexOf(el) : -1;
+    if (i >= 0) setFocusBlock(i);
   }
 
-  function openQuote() {
-    if (!selectedText.trim()) return;
-    quoteOpen = true;
-    toolbarVisible = false;
-  }
-
-  function saveComment(body: string) {
-    onAddComment?.({
-      body,
-      excerpt: selectedText.trim().slice(0, 2000),
-      chapterLabel: relocatedLabel || undefined,
+  async function search(query: string): Promise<SearchHit[]> {
+    const hits: SearchHit[] = [];
+    articles.forEach((art, si) => {
+      const text = art.textContent ?? "";
+      for (const start of findAll(text, query)) {
+        const ex = excerptAround(text, start, start + query.trim().length);
+        hits.push({
+          id: `s:${si}:${start}`,
+          label: sections[si]?.title || `Раздел ${si + 1}`,
+          ...ex,
+          loc: `s:${si}:${start}:${query.trim().length}`,
+        });
+      }
     });
-    document.getSelection()?.removeAllRanges();
+    return hits.slice(0, 400);
   }
 
-  function saveQuote(opts: QuoteDraftOptions) {
-    onAddQuote?.({ text: opts.text, options: opts });
-    document.getSelection()?.removeAllRanges();
+  async function goToHit(hit: SearchHit) {
+    const [, si, start, len] = hit.loc.split(":");
+    const art = articles[Number(si)];
+    if (!art) return;
+    const loc = hit.match ? locateText(art, hit.match, Number(start)) : null;
+    const range = loc
+      ? rangeFromOffsets(art, loc.start, loc.end)
+      : rangeFromOffsets(art, Number(start), Number(start) + Number(len));
+    if (!range) return;
+    const marks = wrapRange(range, () => {
+      const m = document.createElement("mark");
+      m.className = "rd-search-hit";
+      return m;
+    });
+    marks[0]?.scrollIntoView({ block: "center", behavior: "smooth" });
+    setTimeout(() => unwrapAll(art, "mark.rd-search-hit"), 2600);
   }
 
-  const pageHintStr = $derived(
-    relocatedLabel ? `Раздел: ${relocatedLabel}` : "Книга FB2",
-  );
+  function isOnScreen(el: HTMLElement) {
+    const rr = scrollRoot!.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    return r.top >= rr.top - 2 && r.bottom <= rr.bottom + 2;
+  }
+
+  async function unitsFromHere(): Promise<ReadingUnit[]> {
+    if (!blocks.length) return [];
+    const start = firstVisibleBlock();
+    const si = blockSection[start];
+    const out: ReadingUnit[] = [];
+    for (let i = start; i < blocks.length && blockSection[i] === si; i++) {
+      const el = blocks[i]!;
+      const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      out.push({
+        text,
+        mark: () => el.classList.add("rd-tts-current"),
+        unmark: () => el.classList.remove("rd-tts-current"),
+        reveal: async () => {
+          if (!isOnScreen(el)) el.scrollIntoView({ block: "center", behavior: "smooth" });
+        },
+      });
+    }
+    return out;
+  }
+
+  async function advanceChapter(): Promise<boolean> {
+    const si = blockSection[firstVisibleBlock()] ?? 0;
+    const next = articles[si + 1];
+    if (!next) return false;
+    next.scrollIntoView({ block: "start" });
+    await new Promise((r) => setTimeout(r, 60));
+    return true;
+  }
+
+  async function chunksBefore(): Promise<TextChunk[]> {
+    if (!blocks.length) return [];
+    const root = scrollRoot!;
+    const rr = root.getBoundingClientRect();
+    // Всё, что видно на экране, уже прочитано.
+    let last = firstVisibleBlock();
+    while (last + 1 < blocks.length && blocks[last + 1]!.getBoundingClientRect().top < rr.bottom) last++;
+    const curSection = blockSection[last] ?? 0;
+    const out: TextChunk[] = [];
+    for (let si = 0; si < curSection; si++) {
+      const text = (articles[si]?.textContent ?? "").replace(/\s+/g, " ").trim();
+      if (text.length < 40) continue;
+      out.push({ id: `sec-${si}`, label: sections[si]?.title || `Раздел ${si + 1}`, text, partial: false });
+    }
+    const parts: string[] = [];
+    for (let i = 0; i <= last; i++) if (blockSection[i] === curSection) parts.push(blocks[i]!.textContent ?? "");
+    const text = parts.join(" ").replace(/\s+/g, " ").trim();
+    if (text) out.push({ id: `sec-${curSection}-partial`, label: sections[curSection]?.title || "Текущий раздел", text, partial: true });
+    return out;
+  }
+
+  const rootStyle = $derived(varsToStyle(typographyVars(reading.s, palette)));
 </script>
 
-<div class="fb2-root" class:reader={variant === "reader"}>
+<div class="fb2-root" style={rootStyle}>
   <div class="fb2-stage-wrap">
     {#if loading}
       <div class="overlay"><span class="hint">Загрузка FB2…</span></div>
     {:else if err}
       <div class="overlay"><span class="error">{err}</span></div>
     {:else}
-      <div class="fb2-scroll" bind:this={scrollRoot}>
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="fb2-scroll"
+        class:focus-dim={reading.s.focus === "paragraph"}
+        bind:this={scrollRoot}
+        onscroll={onScroll}
+        onclick={onRootClick}
+        onmousemove={onRootMouseMove}
+        lang="ru"
+      >
         {#if coverHtml.trim()}
           <div class="fb2-cover-block fb2-html">{@html coverHtml}</div>
         {/if}
@@ -358,40 +600,11 @@
             </article>
           {/each}
         {/if}
+        <div class="fb2-end" aria-hidden="true">✦</div>
       </div>
     {/if}
   </div>
 </div>
-
-{#if interactionsEnabled}
-  <ReaderSelectionToolbar
-    visible={toolbarVisible}
-    x={toolbarX}
-    y={toolbarY}
-    onCopy={doCopy}
-    onComment={openComment}
-    onQuote={openQuote}
-  />
-
-  <CommentDialog
-    open={commentOpen}
-    excerpt={selectedText}
-    pageHint={pageHintStr}
-    onClose={() => (commentOpen = false)}
-    onSave={saveComment}
-  />
-
-  <QuoteDialog
-    open={quoteOpen}
-    quoteText={selectedText}
-    bookTitle={displayTitle}
-    bookAuthor={displayAuthor}
-    pageLabel=""
-    chapterLabel={relocatedLabel}
-    onClose={() => (quoteOpen = false)}
-    onSave={saveQuote}
-  />
-{/if}
 
 <style>
   .fb2-root {
@@ -399,11 +612,11 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--reader-bg);
-  }
-
-  .fb2-root.reader {
-    background: var(--elevated-soft);
+    background: var(--rd-bg);
+    color: var(--rd-text);
+    transition:
+      background 0.35s ease,
+      color 0.35s ease;
   }
 
   .fb2-stage-wrap {
@@ -418,17 +631,25 @@
     flex: 1;
     overflow: auto;
     min-height: 0;
-    padding: 0.75rem 1.1rem 1.25rem;
-    scroll-behavior: smooth;
+    padding: 2rem var(--rd-margin) 3rem;
+    font-family: var(--rd-font);
+    font-size: var(--rd-size);
+    line-height: var(--rd-line);
+    letter-spacing: var(--rd-letter);
+    word-spacing: var(--rd-word);
+    hyphens: var(--rd-hyphens);
+    -webkit-hyphens: var(--rd-hyphens);
+    color: var(--rd-text);
+    scrollbar-gutter: stable;
   }
 
   .fb2-section {
-    max-width: 40rem;
-    margin: 0 auto 1.75rem;
+    max-width: var(--rd-measure);
+    margin: 0 auto 2.2em;
   }
 
   .fb2-split-section {
-    max-width: min(52rem, 100%);
+    max-width: min(calc(var(--rd-measure) * 2), 100%);
   }
 
   .fb2-split-head {
@@ -437,17 +658,16 @@
 
   .fb2-sec-title-tr {
     margin: 0.35rem 0 0;
-    font-size: 0.95rem;
+    font-size: 0.9em;
     font-weight: 550;
-    color: var(--muted);
-    font-family: system-ui, sans-serif;
+    color: var(--rd-muted);
     line-height: 1.35;
   }
 
   .fb2-split-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 0 1rem;
+    gap: 0 1.2rem;
     align-items: start;
   }
 
@@ -464,77 +684,75 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.14em;
-    color: var(--muted);
+    color: var(--rd-muted);
     font-family: system-ui, sans-serif;
   }
 
   .fb2-split-col {
     min-width: 0;
-    padding: 0.5rem 0.55rem;
-    border-radius: var(--radius-md);
-    border: 1px solid color-mix(in srgb, var(--border-soft) 85%, transparent);
-    background: color-mix(in srgb, var(--elevated-soft) 55%, transparent);
   }
 
   .fb2-sec-title {
-    margin: 0 0 0.85rem;
-    font-size: 1.05rem;
-    font-weight: 650;
-    color: var(--text-soft);
-    font-family: system-ui, sans-serif;
-    letter-spacing: -0.02em;
+    margin: 0 0 1.1em;
+    font-size: 1.35em;
+    font-weight: 600;
+    line-height: 1.25;
+    text-align: center;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
   }
 
   .fb2-html {
-    font-size: 1.02rem;
-    line-height: 1.65;
-    color: var(--text-soft);
-    font-family: Literata, Georgia, serif;
     overflow-wrap: break-word;
   }
 
   .fb2-html :global(.fb2-p) {
-    margin: 0 0 0.65em;
-    text-indent: 1.25em;
-  }
-
-  .fb2-html :global(.fb2-p:first-child) {
-    text-indent: 0;
+    margin: 0 0 var(--rd-para);
+    text-indent: var(--rd-indent);
+    text-align: var(--rd-align);
   }
 
   .fb2-html :global(.fb2-empty-line) {
-    height: 0.65em;
+    height: 0.8em;
   }
 
   .fb2-html :global(.fb2-subtitle) {
-    margin: 1.1em 0 0.5em;
-    font-size: 1rem;
+    margin: 1.4em 0 0.7em;
+    font-size: 1.05em;
     font-weight: 600;
-    font-family: system-ui, sans-serif;
+    text-align: center;
   }
 
   .fb2-html :global(.fb2-epigraph) {
-    margin: 1rem 0;
-    padding: 0.55rem 0 0.55rem 0.85rem;
-    border-left: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    margin: 1.2em 0 1.6em auto;
+    max-width: 80%;
     font-style: italic;
-    color: var(--muted);
+    font-size: 0.94em;
+    color: var(--rd-muted);
+  }
+
+  .fb2-html :global(.fb2-epigraph .fb2-p) {
+    text-indent: 0;
+    text-align: left;
   }
 
   .fb2-html :global(.fb2-poem) {
-    margin: 1rem 0;
+    margin: 1.2em 0 1.2em 1.5em;
   }
 
   .fb2-html :global(.fb2-stanza) {
-    margin-bottom: 0.75em;
+    margin-bottom: 0.9em;
   }
 
   .fb2-html :global(.fb2-v) {
-    margin: 0.15em 0;
-    padding-left: 1em;
+    margin: 0.1em 0;
   }
 
   .fb2-html :global(.fb2-cite) {
+    display: block;
+    margin: 1em 0;
+    padding-left: 1em;
+    border-left: 2px solid color-mix(in srgb, var(--rd-accent) 40%, transparent);
     font-style: italic;
   }
 
@@ -542,46 +760,109 @@
   .fb2-html :global(.fb2-date) {
     margin: 0.35em 0;
     font-size: 0.92em;
-    color: var(--muted);
+    color: var(--rd-muted);
     text-indent: 0;
+    text-align: right;
+  }
+
+  .fb2-html :global(.fb2-noteref) {
+    font-size: 0.72em;
+    vertical-align: super;
+    color: var(--rd-accent);
   }
 
   .fb2-html :global(.fb2-fig) {
-    margin: 1rem auto;
+    margin: 1.2em auto;
     text-align: center;
     max-width: 100%;
   }
 
   .fb2-cover-block {
-    margin: 0 auto 1.35rem;
-    padding: 0 0.25rem;
-    max-width: min(100%, 36rem);
+    margin: 0 auto 2.4rem;
+    max-width: min(100%, 22rem);
     text-align: center;
   }
   .fb2-cover-block :global(.fb2-img) {
     max-width: 100%;
     height: auto;
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-soft);
+    border-radius: 6px;
+    box-shadow: var(--shadow-book);
   }
   .fb2-html :global(.fb2-img) {
     max-width: 100%;
     height: auto;
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-soft);
+    border-radius: 4px;
   }
 
   .fb2-html :global(.fb2-table) {
     width: 100%;
     border-collapse: collapse;
     margin: 1rem 0;
-    font-size: 0.92em;
+    font-size: 0.9em;
   }
 
   .fb2-html :global(.fb2-table td),
   .fb2-html :global(.fb2-table th) {
-    border: 1px solid var(--border-soft);
+    border: 1px solid color-mix(in srgb, var(--rd-muted) 40%, transparent);
     padding: 0.35rem 0.45rem;
+  }
+
+  .fb2-scroll :global(mark.rd-hl) {
+    color: inherit;
+    border-radius: 2px;
+    cursor: pointer;
+    background: color-mix(in srgb, var(--hl) 45%, transparent);
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+  .fb2-scroll :global(mark.rd-hl-yellow) {
+    --hl: #f5d565;
+  }
+  .fb2-scroll :global(mark.rd-hl-green) {
+    --hl: #94d49a;
+  }
+  .fb2-scroll :global(mark.rd-hl-blue) {
+    --hl: #8ec5ee;
+  }
+  .fb2-scroll :global(mark.rd-hl-pink) {
+    --hl: #f2a3c0;
+  }
+  .fb2-scroll :global(mark.rd-hl-violet) {
+    --hl: #c3a8f0;
+  }
+  .fb2-scroll :global(mark.rd-hl-note) {
+    border-bottom: 2px dotted color-mix(in srgb, var(--rd-text) 55%, transparent);
+  }
+  .fb2-scroll :global(mark.rd-search-hit) {
+    color: inherit;
+    background: color-mix(in srgb, var(--rd-accent) 38%, transparent);
+    border-radius: 2px;
+    animation: hit-pulse 1.2s ease-out 2;
+  }
+  .fb2-scroll :global(.rd-tts-current) {
+    background: color-mix(in srgb, var(--rd-accent) 14%, transparent);
+    border-radius: 4px;
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--rd-accent) 14%, transparent);
+  }
+  .fb2-scroll.focus-dim :global(:is(.fb2-p, .fb2-v, h2, h3)) {
+    opacity: 0.3;
+    transition: opacity 0.25s ease;
+  }
+  .fb2-scroll.focus-dim :global(.rd-focus-current) {
+    opacity: 1;
+  }
+
+  .fb2-end {
+    text-align: center;
+    color: var(--rd-muted);
+    opacity: 0.6;
+    padding: 1rem 0 30vh;
+  }
+
+  @keyframes hit-pulse {
+    50% {
+      background: color-mix(in srgb, var(--rd-accent) 65%, transparent);
+    }
   }
 
   .overlay {
@@ -590,12 +871,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: color-mix(in srgb, var(--elevated-soft) 85%, transparent);
+    background: var(--rd-bg);
     z-index: 2;
   }
 
   .hint {
-    color: var(--muted);
+    color: var(--rd-muted);
     font-size: 0.9rem;
   }
 
@@ -610,33 +891,17 @@
   @media (max-width: 600px) {
     .fb2-scroll {
       padding:
-        1rem
-        max(0.9rem, env(safe-area-inset-right))
+        1.2rem
+        max(16px, env(safe-area-inset-right))
         max(1.5rem, env(safe-area-inset-bottom))
-        max(0.9rem, env(safe-area-inset-left));
+        max(16px, env(safe-area-inset-left));
       overscroll-behavior: contain;
-      scroll-padding-top: 1rem;
-    }
-
-    .fb2-section {
-      margin-bottom: 1.35rem;
-    }
-
-    .fb2-sec-title {
-      font-size: 1.12rem;
-      line-height: 1.3;
-    }
-
-    .fb2-html {
-      font-size: 1.04rem;
-      line-height: 1.7;
     }
 
     .fb2-html :global(.fb2-table) {
       display: block;
       max-width: 100%;
       overflow-x: auto;
-      overscroll-behavior-x: contain;
     }
   }
 </style>

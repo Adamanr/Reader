@@ -1,45 +1,44 @@
 <script lang="ts">
-  import { tick } from "svelte";
-  import {
-    AnnotationType,
-    getDocument,
-    GlobalWorkerOptions,
-    TextLayer,
-  } from "pdfjs-dist";
+  import { untrack } from "svelte";
+  import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
   import type { PDFDocumentProxy } from "pdfjs-dist";
   import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-  import type { PdfOutlineItem, PdfReadyInfo, QuoteDraftOptions } from "$lib/types";
-  import { writeTextToClipboard } from "$lib/clipboardWrite";
   import "pdfjs-dist/legacy/web/pdf_viewer.css";
-  import ReaderSelectionToolbar from "$lib/components/ReaderSelectionToolbar.svelte";
-  import CommentDialog from "$lib/components/CommentDialog.svelte";
-  import QuoteDialog from "$lib/components/QuoteDialog.svelte";
-  import {
-    extractReadablePageText,
-    splitForTranslation,
-  } from "$lib/pdf/readablePageText";
+  import type {
+    EpubReaderApi,
+    Highlight,
+    PdfOutlineItem,
+    PdfReadyInfo,
+    ReaderSelection,
+    ReadingPosition,
+    ReadingUnit,
+    SearchHit,
+    TextChunk,
+  } from "$lib/types";
+  import PdfPage, { type CropBox } from "$lib/components/PdfPage.svelte";
+  import { extractReadablePageText, splitForTranslation } from "$lib/pdf/readablePageText";
   import { translateStringList } from "$lib/translate/translateApi";
   import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
+  import { reading, updateReading } from "$lib/reading/settings.svelte";
+  import type { PagePalette } from "$lib/reading/palette";
+  import { excerptAround, findAll, offsetOfPoint } from "$lib/reading/textAnchor";
+  import { ensureAppFonts } from "$lib/reading/fonts";
+  import { typographyVars, varsToStyle } from "$lib/reading/contentCss";
 
   GlobalWorkerOptions.workerSrc = pdfWorker;
 
   interface Props {
     relativePath: string;
-    variant?: "full" | "reader";
     pageNum?: number;
-    scale?: number;
+    palette: PagePalette;
+    highlights?: Highlight[];
     onPdfReady?: (info: PdfReadyInfo) => void;
-    displayTitle?: string;
-    displayAuthor?: string;
-    chapterLabel?: string;
-    onAddComment?: (c: {
-      body: string;
-      excerpt: string;
-      page?: number;
-      chapterLabel?: string;
-    }) => void;
-    onAddQuote?: (q: { text: string; options: QuoteDraftOptions }) => void;
-    /** Показать колонку с текстом перевода страницы */
+    onPosition?: (p: ReadingPosition) => void;
+    onReaderApi?: (api: EpubReaderApi | null) => void;
+    onSelection?: (s: ReaderSelection | null) => void;
+    onHighlightClick?: (id: string, rect: DOMRect) => void;
+    onCenterTap?: () => void;
+    /** Показать текст перевода страницы вместо скана */
     pdfTranslationPanel?: boolean;
     translateRunKey?: number;
     translateSource?: string;
@@ -47,20 +46,19 @@
     onTranslateActivity?: (p: { busy: boolean; error: string | null }) => void;
     /** Полный перевод книги: сегменты по страницам (ключ — номер страницы строкой) */
     pdfInlineSpans?: Record<string, string[]> | null;
-    /** Показывать перевод поверх скана (иначе только для выделения, прозрачный текст) */
     pdfInlineShow?: boolean;
   }
   let {
     relativePath,
-    variant = "full",
     pageNum = $bindable(1),
-    scale = $bindable(1),
+    palette,
+    highlights = [],
     onPdfReady,
-    displayTitle = "",
-    displayAuthor = "",
-    chapterLabel = "",
-    onAddComment,
-    onAddQuote,
+    onPosition,
+    onReaderApi,
+    onSelection,
+    onHighlightClick,
+    onCenterTap,
     pdfTranslationPanel = false,
     translateRunKey = 0,
     translateSource = "auto",
@@ -70,49 +68,74 @@
     pdfInlineShow = true,
   }: Props = $props();
 
-  let canvas = $state<HTMLCanvasElement | null>(null);
-  /** Область прокрутки чтения (страница PDF или текст перевода) — для колеса страниц */
-  let scrollHost = $state<HTMLDivElement | null>(null);
-  let pageStackEl = $state<HTMLDivElement | null>(null);
-  let textLayerEl = $state<HTMLDivElement | null>(null);
-  let linkLayerEl = $state<HTMLDivElement | null>(null);
-  /** Выделение в режиме перевода (текст вместо страницы) */
+  ensureAppFonts();
+
+  let scroller = $state<HTMLDivElement | null>(null);
   let transBodyEl = $state<HTMLDivElement | null>(null);
   let numPages = $state(0);
   let loading = $state(true);
   let err = $state<string | null>(null);
   let pdfDoc = $state<PDFDocumentProxy | null>(null);
-  let textLayerInst: InstanceType<typeof TextLayer> | null = null;
-  let pageStackStyle = $state("");
+  let outline: PdfOutlineItem[] = [];
 
-  let toolbarVisible = $state(false);
-  let toolbarX = $state(0);
-  let toolbarY = $state(0);
-  let selectedText = $state("");
+  /** Размер первой страницы — по нему размечаем все, пока не узнаем точнее. */
+  let defaultBase = $state({ w: 612, h: 792 });
+  let baseOverrides = $state<Record<number, { w: number; h: number }>>({});
+  let crop = $state<CropBox>({ x: 0, y: 0, w: 1, h: 1 });
+  let viewW = $state(800);
+  let viewH = $state(600);
+  let visiblePages = $state<Set<number>>(new Set());
+  let flash = $state<{ page: number; start: number; len: number; text?: string } | null>(null);
+  /** Страница, о которой мы сами сообщили наружу при прокрутке */
+  let reportedPage = 0;
 
-  let commentOpen = $state(false);
-  let quoteOpen = $state(false);
+  const mode = $derived(reading.s.pdfMode);
+  const perRow = $derived(mode === "spread" ? 2 : 1);
+  const GAP = 14;
 
-  const interactionsEnabled = $derived(!!(onAddComment && onAddQuote));
+  const pageTexts = new Map<number, string>();
 
-  async function resolveDestToPageNumber(
-    pdf: PDFDocumentProxy,
-    dest: string | unknown[] | null | undefined,
-  ): Promise<number | null> {
-    if (dest == null) return null;
-    if (typeof dest === "string") {
-      const resolved = await pdf.getDestination(dest);
-      return resolveDestToPageNumber(pdf, resolved);
+  function baseOf(n: number) {
+    return baseOverrides[n] ?? defaultBase;
+  }
+
+  const scale = $derived.by(() => {
+    const s = reading.s;
+    if (s.pdfFit === "custom") return s.pdfZoom;
+    const b = defaultBase;
+    const cw = b.w * crop.w * perRow + GAP * (perRow - 1);
+    const ch = b.h * crop.h;
+    const pad = viewW < 600 ? 12 : 48;
+    const byWidth = Math.max(0.2, (viewW - pad) / cw);
+    const capped = Math.min(byWidth, perRow === 1 && viewW > 900 ? 2.2 : 4);
+    if (s.pdfFit === "page") return Math.min(capped, Math.max(0.2, (viewH - 28) / ch));
+    return capped;
+  });
+
+  const rows = $derived.by(() => {
+    const out: number[][] = [];
+    for (let i = 1; i <= numPages; i += perRow) {
+      const row = [i];
+      if (perRow === 2 && i + 1 <= numPages) row.push(i + 1);
+      out.push(row);
     }
-    if (Array.isArray(dest) && dest.length > 0) {
-      const target = dest[0];
-      if (target && typeof target === "object") {
-        try {
-          const idx = await pdf.getPageIndex(target as Parameters<PDFDocumentProxy["getPageIndex"]>[0]);
-          return idx + 1;
-        } catch {
-          return null;
-        }
+    return out;
+  });
+
+  const shownRows = $derived.by(() => {
+    if (mode === "continuous") return rows;
+    const idx = Math.floor((pageNum - 1) / perRow);
+    return rows[idx] ? [rows[idx]!] : [];
+  });
+
+  async function resolveDestToPageNumber(pdf: PDFDocumentProxy, dest: unknown): Promise<number | null> {
+    if (dest == null) return null;
+    if (typeof dest === "string") return resolveDestToPageNumber(pdf, await pdf.getDestination(dest));
+    if (Array.isArray(dest) && dest.length > 0 && dest[0] && typeof dest[0] === "object") {
+      try {
+        return (await pdf.getPageIndex(dest[0] as Parameters<PDFDocumentProxy["getPageIndex"]>[0])) + 1;
+      } catch {
+        return null;
       }
     }
     return null;
@@ -128,31 +151,69 @@
       const title = node.title?.trim() || "Без названия";
       const page = await resolveDestToPageNumber(pdf, node.dest);
       out.push({ title, page, level: depth });
-      if (node.items?.length) {
-        out.push(...(await flattenOutline(pdf, node.items, depth + 1)));
-      }
+      if (node.items?.length) out.push(...(await flattenOutline(pdf, node.items, depth + 1)));
     }
     return out;
+  }
+
+  /** Белые поля: ищем границы содержимого на нескольких страницах. */
+  async function detectCrop(doc: PDFDocumentProxy): Promise<CropBox> {
+    let minX = 1;
+    let minY = 1;
+    let maxX = 0;
+    let maxY = 0;
+    const sample = [1, 2, 3, Math.ceil(doc.numPages / 2)].filter((p, i, a) => p <= doc.numPages && a.indexOf(p) === i);
+    for (const p of sample) {
+      const page = await doc.getPage(p);
+      const vp = page.getViewport({ scale: 0.4 });
+      const c = document.createElement("canvas");
+      c.width = Math.ceil(vp.width);
+      c.height = Math.ceil(vp.height);
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      if (!ctx) continue;
+      await page.render({ canvas: c, canvasContext: ctx, viewport: vp, background: "#ffffff" }).promise;
+      const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height);
+      for (let y = 0; y < height; y += 2) {
+        for (let x = 0; x < width; x += 2) {
+          const i = (y * width + x) * 4;
+          if (data[i]! < 235 || data[i + 1]! < 235 || data[i + 2]! < 235) {
+            minX = Math.min(minX, x / width);
+            maxX = Math.max(maxX, x / width);
+            minY = Math.min(minY, y / height);
+            maxY = Math.max(maxY, y / height);
+          }
+        }
+      }
+    }
+    if (maxX <= minX || maxY <= minY) return { x: 0, y: 0, w: 1, h: 1 };
+    const m = 0.02;
+    const x = Math.max(0, minX - m);
+    const y = Math.max(0, minY - m);
+    return { x, y, w: Math.min(1, maxX + m) - x, h: Math.min(1, maxY + m) - y };
   }
 
   async function loadPdf() {
     loading = true;
     err = null;
+    pdfDoc?.destroy();
     pdfDoc = null;
     numPages = 0;
-    pageNum = 1;
-    textLayerInst?.cancel();
-    textLayerInst = null;
+    baseOverrides = {};
+    pageTexts.clear();
+    onReaderApi?.(null);
     try {
       const bytes = await readLibraryBookBytes(relativePath);
-      const loadingTask = getDocument({ data: bytes });
-      const doc = await loadingTask.promise;
+      const doc = await getDocument({ data: bytes }).promise;
+      const first = await doc.getPage(1);
+      const vp = first.getViewport({ scale: 1 });
+      defaultBase = { w: vp.width, h: vp.height };
       pdfDoc = doc;
       numPages = doc.numPages;
-
+      if (pageNum > numPages || pageNum < 1) pageNum = 1;
       const rawOutline = await doc.getOutline();
-      const outline = rawOutline?.length ? await flattenOutline(doc, rawOutline) : [];
+      outline = rawOutline?.length ? await flattenOutline(doc, rawOutline) : [];
       onPdfReady?.({ outline, numPages });
+      onReaderApi?.(buildApi());
     } catch (e) {
       err = String(e);
       onPdfReady?.({ outline: [], numPages: 0 });
@@ -161,290 +222,414 @@
     }
   }
 
-  async function renderLinks(
-    page: import("pdfjs-dist").PDFPageProxy,
-    viewport: import("pdfjs-dist").PageViewport,
-    pdf: PDFDocumentProxy,
-    layer: HTMLDivElement,
-  ) {
-    layer.innerHTML = "";
-    layer.style.width = `${viewport.width}px`;
-    layer.style.height = `${viewport.height}px`;
-    const annotations = await page.getAnnotations({ intent: "display" });
-    for (const ann of annotations) {
-      if (ann.annotationType !== AnnotationType.LINK) continue;
-      const rect = ann.rect;
-      if (!rect || rect.length < 4) continue;
-      const [vx1, vy1, vx2, vy2] = viewport.convertToViewportRectangle(rect);
-      const left = Math.min(vx1, vx2);
-      const top = Math.min(vy1, vy2);
-      const w = Math.abs(vx2 - vx1);
-      const h = Math.abs(vy2 - vy1);
-      const box = document.createElement("div");
-      box.className = "pdf-link-box";
-      box.style.left = `${left}px`;
-      box.style.top = `${top}px`;
-      box.style.width = `${w}px`;
-      box.style.height = `${h}px`;
-      const url = ann.url || ann.unsafeUrl;
-      if (typeof url === "string" && url.length > 0) {
-        const a = document.createElement("a");
-        a.href = url;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.className = "pdf-link-hit";
-        a.textContent = "";
-        box.appendChild(a);
-        layer.appendChild(box);
-      } else if (ann.dest != null) {
-        const destVal = ann.dest;
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "pdf-link-hit";
-        btn.addEventListener("click", async () => {
-          const targetPage = await resolveDestToPageNumber(pdf, destVal);
-          if (targetPage != null) pageNum = targetPage;
-        });
-        box.appendChild(btn);
-        layer.appendChild(box);
-      }
-    }
-  }
-
-  let renderToken = 0;
+  $effect(() => {
+    relativePath;
+    untrack(() => void loadPdf());
+  });
 
   $effect(() => {
-    if (!pdfDoc || !canvas || !pageStackEl || !textLayerEl || !linkLayerEl) return;
-    if (loading || err) return;
-
     const doc = pdfDoc;
-    const pn = pageNum;
-    const sc = scale;
-    const inlineSpans = pdfInlineSpans;
-    const inlineShow = pdfInlineShow;
-    const myToken = ++renderToken;
+    const on = reading.s.pdfCrop;
+    if (!doc || !on) {
+      crop = { x: 0, y: 0, w: 1, h: 1 };
+      return;
+    }
+    void detectCrop(doc).then((c) => {
+      if (pdfDoc === doc && reading.s.pdfCrop) crop = c;
+    });
+  });
 
-    void (async () => {
-      textLayerInst?.cancel();
-      textLayerInst = null;
-      textLayerEl!.innerHTML = "";
-      linkLayerEl!.innerHTML = "";
+  $effect(() => {
+    const el = scroller;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      viewW = el.clientWidth;
+      viewH = el.clientHeight;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
 
-      const page = await doc.getPage(pn);
-      if (myToken !== renderToken) return;
-
-      const viewport = page.getViewport({ scale });
-      pageStackStyle = `width:${viewport.width}px;height:${viewport.height}px`;
-
-      await tick();
-
-      if (myToken !== renderToken) return;
-
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-
-      await page
-        .render({
-          canvas,
-          canvasContext: ctx,
-          viewport,
-          background: "#ffffff",
-          /** Должен совпадать с intent в getOptionalContentConfig (иначе pdf.js бросает и страница белая). */
-          intent: "any",
-          optionalContentConfigPromise: doc.getOptionalContentConfig({ intent: "any" }),
-        })
-        .promise;
-      if (myToken !== renderToken) return;
-
-      textLayerInst = new TextLayer({
-        textContentSource: page.streamTextContent(),
-        container: textLayerEl,
-        viewport,
-      });
-      await textLayerInst.render();
-      if (myToken !== renderToken) return;
-
-      const inline = inlineSpans?.[String(pn)];
-      if (
-        inline &&
-        textLayerInst &&
-        inline.length === textLayerInst.textContentItemsStr.length
-      ) {
-        const divs = textLayerInst.textDivs;
-        for (let i = 0; i < inline.length; i++) {
-          const el = divs[i];
-          if (!el) continue;
-          el.textContent = inline[i] ?? "";
-          if (inlineShow) el.classList.add("pdf-inline-tr");
-          else el.classList.remove("pdf-inline-tr");
+  /** Рендерим только страницы рядом с экраном — большие PDF не съедают память. */
+  $effect(() => {
+    const el = scroller;
+    rows;
+    if (!el || mode !== "continuous") return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const next = new Set(visiblePages);
+        for (const e of entries) {
+          const n = Number((e.target as HTMLElement).dataset.row);
+          if (e.isIntersecting) next.add(n);
+          else next.delete(n);
         }
-        textLayerInst.update({ viewport });
-      } else if (textLayerInst) {
-        for (const el of textLayerInst.textDivs) {
-          el.classList.remove("pdf-inline-tr");
-        }
-      }
-
-      if (myToken !== renderToken) return;
-
-      await renderLinks(page, viewport, doc, linkLayerEl);
-    })();
-
+        visiblePages = next;
+      },
+      { root: el, rootMargin: "120% 0px" },
+    );
+    const t = setTimeout(() => {
+      for (const r of Array.from(el.querySelectorAll<HTMLElement>("[data-row]"))) io.observe(r);
+    }, 0);
     return () => {
-      renderToken += 1;
-      textLayerInst?.cancel();
-      textLayerInst = null;
+      clearTimeout(t);
+      io.disconnect();
     };
   });
 
+  function rowTop(rowIdx: number): number {
+    const el = scroller?.querySelector<HTMLElement>(`[data-row="${rowIdx}"]`);
+    return el ? el.offsetTop : 0;
+  }
+
+  function scrollToPage(n: number, smooth = false) {
+    const el = scroller;
+    if (!el) return;
+    const idx = Math.floor((n - 1) / perRow);
+    el.scrollTo({ top: Math.max(0, rowTop(idx) - 12), behavior: smooth ? "smooth" : "auto" });
+  }
+
+  /** Внешняя смена страницы (оглавление, ссылки) — прокручиваем к ней. */
   $effect(() => {
-    relativePath;
-    void loadPdf();
+    const n = pageNum;
+    const m = mode;
+    if (loading || !numPages) return;
+    if (m !== "continuous") {
+      scroller?.scrollTo({ top: 0 });
+      return;
+    }
+    if (n === reportedPage) return;
+    requestAnimationFrame(() => scrollToPage(n));
+    reportedPage = n;
   });
 
-  function prev() {
-    if (pageNum > 1) pageNum -= 1;
-  }
-  function next() {
-    if (pageNum < numPages) pageNum += 1;
-  }
+  /** Масштаб поменялся — остаёмся на той же странице. */
+  $effect(() => {
+    scale;
+    perRow;
+    const n = untrack(() => pageNum);
+    if (untrack(() => mode) !== "continuous") return;
+    requestAnimationFrame(() => scrollToPage(n));
+  });
 
-  function keyNavAllowed(target: EventTarget | null) {
-    const el = target as HTMLElement | null;
-    if (!el) return true;
-    return !el.closest("input, textarea, select, [contenteditable=true]");
-  }
-
-  function onWindowKeydown(e: KeyboardEvent) {
-    if (loading || err || !pdfDoc || numPages === 0) return;
-    if (!keyNavAllowed(e.target)) return;
-    if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      prev();
-    } else if (e.key === "ArrowRight") {
-      e.preventDefault();
-      next();
+  function currentFromScroll() {
+    const el = scroller;
+    if (!el || mode !== "continuous") return;
+    const line = el.scrollTop + el.clientHeight * 0.3;
+    const rowsEls = Array.from(el.querySelectorAll<HTMLElement>("[data-row]"));
+    let lo = 0;
+    let hi = rowsEls.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (rowsEls[mid]!.offsetTop <= line) lo = mid;
+      else hi = mid - 1;
     }
+    const n = lo * perRow + 1;
+    if (n !== pageNum) {
+      reportedPage = n;
+      pageNum = n;
+    }
+    emitPosition();
+  }
+
+  let scrollRaf = 0;
+  function onScroll() {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      currentFromScroll();
+    });
+  }
+
+  function chapterAt(n: number): { label: string; next: number } {
+    let label = "";
+    let best = -1;
+    let next = numPages + 1;
+    for (const o of outline) {
+      if (o.page == null) continue;
+      if (o.page <= n && o.page >= best) {
+        best = o.page;
+        label = o.title;
+      }
+      if (o.page > n && o.page < next) next = o.page;
+    }
+    return { label, next };
+  }
+
+  function emitPosition() {
+    if (!numPages) return;
+    const n = pageNum;
+    const { label, next } = chapterAt(n);
+    let within = 0;
+    const el = scroller;
+    if (el && mode === "continuous") {
+      const idx = Math.floor((n - 1) / perRow);
+      const rowEl = el.querySelector<HTMLElement>(`[data-row="${idx}"]`);
+      if (rowEl) within = Math.min(1, Math.max(0, (el.scrollTop - rowEl.offsetTop) / Math.max(1, rowEl.offsetHeight)));
+    }
+    const atEnd = el ? el.scrollTop + el.clientHeight >= el.scrollHeight - 4 : false;
+    onPosition?.({
+      progress: atEnd ? 1 : Math.min(1, (n - 1 + within) / numPages),
+      chapterLabel: label,
+      charsLeftChapter: null,
+      charsLeftBook: null,
+      pagesLeftChapter: Math.max(0, next - n - within),
+      pagesLeftBook: Math.max(0, numPages - n + 1 - within),
+      pageLabel: `${n} / ${numPages}`,
+    });
+  }
+
+  $effect(() => {
+    pageNum;
+    numPages;
+    untrack(emitPosition);
+  });
+
+  function go(delta: number) {
+    const target = Math.min(numPages, Math.max(1, pageNum + delta * perRow));
+    if (mode === "continuous") scrollToPage(target, true);
+    pageNum = target;
   }
 
   let wheelAccum = 0;
   let wheelReset = 0;
-
-  $effect(() => {
-    const el = scrollHost;
-    if (!el || loading || err || !pdfDoc) return;
-
-    const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.metaKey) return;
+  function onWheel(e: WheelEvent) {
+    if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
-
-      wheelAccum += e.deltaY;
-      window.clearTimeout(wheelReset);
-      wheelReset = window.setTimeout(() => {
-        wheelAccum = 0;
-      }, 160);
-
-      const threshold = 50;
-      if (wheelAccum >= threshold) {
-        next();
-        wheelAccum = 0;
-      } else if (wheelAccum <= -threshold) {
-        prev();
-        wheelAccum = 0;
-      }
-    };
-
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => {
-      el.removeEventListener("wheel", onWheel);
-      window.clearTimeout(wheelReset);
-    };
-  });
-
-  function refreshToolbar() {
-    if (!interactionsEnabled || loading || err) {
-      toolbarVisible = false;
+      const next = Math.min(5, Math.max(0.3, scale * (e.deltaY < 0 ? 1.08 : 1 / 1.08)));
+      updateReading({ pdfFit: "custom", pdfZoom: Number(next.toFixed(3)) });
       return;
     }
+    if (mode === "continuous" || pdfTranslationPanel) return;
+    const el = scroller;
+    // Внутри увеличенной страницы сначала прокручиваем её саму.
+    if (el && el.scrollHeight > el.clientHeight + 4) {
+      const atTop = el.scrollTop <= 0;
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+      if ((e.deltaY > 0 && !atBottom) || (e.deltaY < 0 && !atTop)) return;
+    }
+    e.preventDefault();
+    wheelAccum += e.deltaY;
+    window.clearTimeout(wheelReset);
+    wheelReset = window.setTimeout(() => (wheelAccum = 0), 160);
+    if (wheelAccum >= 50) {
+      go(1);
+      wheelAccum = 0;
+    } else if (wheelAccum <= -50) {
+      go(-1);
+      wheelAccum = 0;
+    }
+  }
+
+  let touchX = 0;
+  let touchY = 0;
+  function onTouchStart(e: TouchEvent) {
+    touchX = e.touches[0]?.clientX ?? 0;
+    touchY = e.touches[0]?.clientY ?? 0;
+  }
+  function onTouchEnd(e: TouchEvent) {
+    if (mode === "continuous") return;
+    const t = e.changedTouches[0];
+    if (!t) return;
+    const dx = t.clientX - touchX;
+    const dy = t.clientY - touchY;
+    if (Math.abs(dx) > 50 && Math.abs(dy) < 60) go(dx < 0 ? 1 : -1);
+  }
+
+  function onStageClick(e: MouseEvent) {
     const sel = document.getSelection();
-    if (!sel || sel.isCollapsed) {
-      toolbarVisible = false;
+    if (sel && !sel.isCollapsed) return;
+    if ((e.target as Element).closest("a, button, mark")) return;
+    const el = scroller;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width;
+    if (reading.s.tapZones && x < 0.2) go(-1);
+    else if (reading.s.tapZones && x > 0.8) go(1);
+    else onCenterTap?.();
+  }
+
+  function refreshSelection() {
+    if (loading || err) return;
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      onSelection?.(null);
       return;
     }
-    const inLayer = textLayerEl?.contains(sel.anchorNode) ?? false;
+    const inPages = scroller?.contains(sel.anchorNode) ?? false;
     const inTrans = transBodyEl?.contains(sel.anchorNode) ?? false;
-    if (!inLayer && !inTrans) {
-      toolbarVisible = false;
+    if (!inPages && !inTrans) return;
+    const text = sel.toString().trim();
+    if (!text) {
+      onSelection?.(null);
       return;
     }
-    const t = sel.toString().trim();
-    if (!t) {
-      toolbarVisible = false;
-      return;
-    }
-    selectedText = t;
     const range = sel.getRangeAt(0);
     const rect = range.getBoundingClientRect();
-    toolbarX = rect.left + rect.width / 2;
-    toolbarY = rect.top;
-    toolbarVisible = true;
+    const node = range.startContainer.nodeType === Node.ELEMENT_NODE ? (range.startContainer as Element) : range.startContainer.parentElement;
+    const pageEl = node?.closest("[data-page]") as HTMLElement | null;
+    const layer = pageEl?.querySelector(".textLayer");
+    const page = pageEl ? Number(pageEl.dataset.page) : pageNum;
+    const offset = layer ? offsetOfPoint(layer, range.startContainer, range.startOffset) : null;
+    onSelection?.({
+      text,
+      rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      anchor: {
+        page,
+        offset: inTrans ? undefined : (offset ?? undefined),
+        chapterLabel: chapterAt(page).label || undefined,
+      },
+      clear: () => document.getSelection()?.removeAllRanges(),
+    });
   }
 
   $effect(() => {
-    if (!interactionsEnabled) return;
-    const onSel = () => requestAnimationFrame(refreshToolbar);
-    const onMouseUp = () => requestAnimationFrame(refreshToolbar);
-    document.addEventListener("selectionchange", onSel);
-    document.addEventListener("mouseup", onMouseUp);
+    const onUp = () => requestAnimationFrame(refreshSelection);
+    document.addEventListener("mouseup", onUp);
+    document.addEventListener("keyup", onUp);
+    document.addEventListener("touchend", onUp);
     return () => {
-      document.removeEventListener("selectionchange", onSel);
-      document.removeEventListener("mouseup", onMouseUp);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("keyup", onUp);
+      document.removeEventListener("touchend", onUp);
     };
   });
 
-  async function doCopy() {
-    const t = selectedText.trim();
-    if (!t) return;
-    try {
-      await writeTextToClipboard(t);
-    } catch {
-      /* ignore */
+  /** Текст страницы в том же виде, что у текстового слоя (для смещений). */
+  async function pageText(n: number): Promise<string> {
+    const cached = pageTexts.get(n);
+    if (cached != null) return cached;
+    if (!pdfDoc) return "";
+    const page = await pdfDoc.getPage(n);
+    const content = await page.getTextContent();
+    const text = content.items.map((it) => ("str" in it ? it.str : "")).join("");
+    pageTexts.set(n, text);
+    return text;
+  }
+
+  async function search(query: string, signal?: AbortSignal): Promise<SearchHit[]> {
+    const hits: SearchHit[] = [];
+    const q = query.trim();
+    if (!q) return hits;
+    for (let n = 1; n <= numPages; n++) {
+      if (signal?.aborted) break;
+      const text = await pageText(n);
+      for (const start of findAll(text, q, 50)) {
+        hits.push({
+          id: `p:${n}:${start}`,
+          label: `стр. ${n}${chapterAt(n).label ? " · " + chapterAt(n).label : ""}`,
+          ...excerptAround(text, start, start + q.length),
+          loc: `p:${n}:${start}:${q.length}`,
+        });
+      }
+      if (hits.length >= 400) break;
+      if (n % 20 === 0) await new Promise((r) => setTimeout(r, 0));
     }
-    toolbarVisible = false;
-    document.getSelection()?.removeAllRanges();
+    return hits;
   }
 
-  function openComment() {
-    if (!selectedText.trim()) return;
-    commentOpen = true;
-    toolbarVisible = false;
+  async function goToHit(hit: SearchHit) {
+    const [, p, start, len] = hit.loc.split(":");
+    const n = Number(p);
+    pageNum = n;
+    if (mode === "continuous") scrollToPage(n);
+    flash = null;
+    setTimeout(() => (flash = { page: n, start: Number(start), len: Number(len), text: hit.match || undefined }), 250);
   }
 
-  function openQuote() {
-    if (!selectedText.trim()) return;
-    quoteOpen = true;
-    toolbarVisible = false;
+  async function unitsFromHere(): Promise<ReadingUnit[]> {
+    if (!pdfDoc) return [];
+    const n = pageNum;
+    const page = await pdfDoc.getPage(n);
+    const text = await extractReadablePageText(page, 1);
+    return text
+      .split(/\n\s*\n/)
+      .map((p) => p.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .map((t) => ({
+        text: t,
+        reveal: async () => {
+          if (pageNum !== n) {
+            pageNum = n;
+            if (mode === "continuous") scrollToPage(n);
+          }
+        },
+      }));
   }
 
-  function saveComment(body: string) {
-    onAddComment?.({
-      body,
-      excerpt: selectedText.trim().slice(0, 2000),
-      page: pageNum,
-    });
-    document.getSelection()?.removeAllRanges();
+  async function advanceChapter(): Promise<boolean> {
+    if (pageNum >= numPages) return false;
+    go(1);
+    await new Promise((r) => setTimeout(r, 120));
+    return true;
   }
 
-  function saveQuote(opts: QuoteDraftOptions) {
-    onAddQuote?.({ text: opts.text, options: opts });
-    document.getSelection()?.removeAllRanges();
+  async function chunksBefore(): Promise<TextChunk[]> {
+    const out: TextChunk[] = [];
+    const last = Math.min(numPages, pageNum + perRow - 1);
+    let buf: string[] = [];
+    let label = "";
+    let startPage = 1;
+    const flush = (end: number, partial: boolean) => {
+      const text = buf.join(" ").replace(/\s+/g, " ").trim();
+      if (text.length > 40) {
+        out.push({
+          id: `pages-${startPage}-${end}${partial ? "-partial" : ""}`,
+          label: label || `Стр. ${startPage}–${end}`,
+          text,
+          partial,
+        });
+      }
+      buf = [];
+    };
+    for (let n = 1; n <= last; n++) {
+      const ch = chapterAt(n).label;
+      const newChunk = outline.length ? ch !== label : (n - 1) % 20 === 0;
+      if (newChunk && n > 1) {
+        flush(n - 1, false);
+        startPage = n;
+      }
+      if (newChunk) label = outline.length ? ch : "";
+      buf.push(await pageText(n));
+    }
+    flush(last, true);
+    return out;
   }
 
-  const zoomPct = $derived(Math.round(scale * 100));
-  const pageLabelStr = $derived(`стр. ${pageNum}`);
+  function buildApi(): EpubReaderApi {
+    return {
+      toc: [],
+      spine: [],
+      goTo: async () => {},
+      prev: async () => go(-1),
+      next: async () => go(1),
+      seek: async (f: number) => {
+        const n = Math.min(numPages, Math.max(1, Math.round(f * numPages) || 1));
+        pageNum = n;
+        if (mode === "continuous") scrollToPage(n);
+      },
+      search,
+      goToHit,
+      unitsFromHere,
+      advanceChapter,
+      chunksBefore,
+    };
+  }
 
+  function highlightsFor(n: number): Highlight[] {
+    return highlights.filter((h) => h.page === n && h.offset != null);
+  }
+
+  function isActive(rowIdx: number): boolean {
+    if (mode !== "continuous") return true;
+    return visiblePages.has(rowIdx);
+  }
+
+  function setBase(n: number, w: number, h: number) {
+    if (n === 1) defaultBase = { w, h };
+    else baseOverrides = { ...baseOverrides, [n]: { w, h } };
+  }
+
+  // ——— Перевод страницы (колонка вместо скана) ———
   let pdfSideText = $state("");
   let pdfSideErr = $state<string | null>(null);
 
@@ -458,18 +643,13 @@
     pdfSideErr = null;
     try {
       const page = await pdfDoc.getPage(pageNum);
-      const structured = await extractReadablePageText(page, scale);
+      const structured = await extractReadablePageText(page, 1);
       if (!structured.trim()) {
         pdfSideText = "На этой странице нет извлекаемого текста.";
         onTranslateActivity?.({ busy: false, error: null });
         return;
       }
-      const chunks = splitForTranslation(structured);
-      const translated = await translateStringList(
-        chunks,
-        translateSource,
-        translateTarget,
-      );
+      const translated = await translateStringList(splitForTranslation(structured), translateSource, translateTarget);
       pdfSideText = translated.join("\n\n");
       onTranslateActivity?.({ busy: false, error: null });
     } catch (e) {
@@ -484,146 +664,200 @@
     translateRunKey;
     pageNum;
     pdfDoc;
-    void refreshPdfTranslation();
+    untrack(() => void refreshPdfTranslation());
   });
+
+  const zoomPct = $derived(Math.round(scale * 100));
+  const invert = $derived(reading.s.pdfInvert);
+  const transStyle = $derived(varsToStyle(typographyVars(reading.s, palette)));
+
+  function zoomBy(f: number) {
+    updateReading({ pdfFit: "custom", pdfZoom: Number(Math.min(5, Math.max(0.3, scale * f)).toFixed(3)) });
+  }
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
-
-<div class="pdf-root" class:reader={variant === "reader"}>
+<div class="pdf-root" style:--page-bg={palette.bg}>
   {#if loading}
     <p class="hint">Загрузка PDF…</p>
   {:else if err}
     <p class="error">{err}</p>
-  {:else}
-    <div class="pdf-main">
-      {#if pdfTranslationPanel}
-        <div class="canvas-wrap pdf-trans-wrap" bind:this={scrollHost}>
-          {#if pdfSideErr}
-            <p class="pdf-trans-err">{pdfSideErr}</p>
-          {:else}
-            <article class="pdf-trans-article" aria-label="Перевод страницы {pageNum}">
-              <p class="pdf-trans-meta">
-                Страница {pageNum} из {numPages}
-              </p>
-              <div class="pdf-trans-body" bind:this={transBodyEl}>{pdfSideText}</div>
-            </article>
-          {/if}
-        </div>
+  {:else if pdfTranslationPanel}
+    <div class="pdf-trans-wrap" style={transStyle}>
+      {#if pdfSideErr}
+        <p class="pdf-trans-err">{pdfSideErr}</p>
       {:else}
-        <div class="canvas-wrap" bind:this={scrollHost}>
-          <div class="page-stack" bind:this={pageStackEl} style={pageStackStyle}>
-            <canvas bind:this={canvas} class="page"></canvas>
-            <div class="textLayer" bind:this={textLayerEl}></div>
-            <div class="link-layer" bind:this={linkLayerEl}></div>
-          </div>
-        </div>
+        <article class="pdf-trans-article" aria-label="Перевод страницы {pageNum}">
+          <p class="pdf-trans-meta">Страница {pageNum} из {numPages}</p>
+          <div class="pdf-trans-body" bind:this={transBodyEl}>{pdfSideText}</div>
+        </article>
       {/if}
-      <footer class="toolbar">
-        {#if variant === "full"}
-          <button type="button" onclick={prev} disabled={pageNum <= 1}>←</button>
-          <span class="pages">{pageNum} / {numPages}</span>
-          <button type="button" onclick={next} disabled={pageNum >= numPages}>→</button>
-        {:else}
-          <span class="pages soft">{pageNum} / {numPages}</span>
-        {/if}
-        {#if !pdfTranslationPanel}
-          <label class="zoom">
-            <span class="zoom-label">{zoomPct}%</span>
-            <input type="range" min="0.5" max="2.5" step="0.05" bind:value={scale} />
-          </label>
-        {/if}
-      </footer>
+    </div>
+  {:else}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="pdf-scroller"
+      class:single={mode !== "continuous"}
+      bind:this={scroller}
+      onscroll={onScroll}
+      onwheel={onWheel}
+      onclick={onStageClick}
+      ontouchstart={onTouchStart}
+      ontouchend={onTouchEnd}
+    >
+      {#each shownRows as row (row[0])}
+        {@const rowIdx = Math.floor((row[0]! - 1) / perRow)}
+        <div class="pdf-row" data-row={rowIdx} style:gap="{GAP}px">
+          {#each row as n (n)}
+            <PdfPage
+              doc={pdfDoc!}
+              {n}
+              {scale}
+              base={baseOf(n)}
+              {crop}
+              active={isActive(rowIdx)}
+              {invert}
+              highlights={highlightsFor(n)}
+              flash={flash?.page === n ? flash : null}
+              inlineSpans={pdfInlineSpans?.[String(n)] ?? null}
+              inlineShow={pdfInlineShow}
+              onLink={(p) => {
+                pageNum = p;
+                if (mode === "continuous") scrollToPage(p);
+              }}
+              onBase={setBase}
+              {onHighlightClick}
+            />
+          {/each}
+        </div>
+      {/each}
+    </div>
+    <div class="pdf-zoom" role="group" aria-label="Масштаб">
+      <button type="button" title="Уменьшить" onclick={() => zoomBy(1 / 1.15)}>−</button>
+      <button
+        type="button"
+        class="pdf-zoom-val"
+        title="Переключить: по ширине / по странице"
+        onclick={() => updateReading({ pdfFit: reading.s.pdfFit === "width" ? "page" : "width" })}
+      >
+        {reading.s.pdfFit === "width" ? "по ширине" : reading.s.pdfFit === "page" ? "страница" : `${zoomPct}%`}
+      </button>
+      <button type="button" title="Увеличить" onclick={() => zoomBy(1.15)}>+</button>
     </div>
   {/if}
 </div>
 
-{#if interactionsEnabled}
-  <ReaderSelectionToolbar
-    visible={toolbarVisible}
-    x={toolbarX}
-    y={toolbarY}
-    onCopy={doCopy}
-    onComment={openComment}
-    onQuote={openQuote}
-  />
-
-  <CommentDialog
-    open={commentOpen}
-    excerpt={selectedText}
-    pageHint={pageLabelStr}
-    onClose={() => (commentOpen = false)}
-    onSave={saveComment}
-  />
-
-  <QuoteDialog
-    open={quoteOpen}
-    quoteText={selectedText}
-    bookTitle={displayTitle}
-    bookAuthor={displayAuthor}
-    pageLabel={pageLabelStr}
-    chapterLabel={chapterLabel}
-    onClose={() => (quoteOpen = false)}
-    onSave={saveQuote}
-  />
-{/if}
-
 <style>
   .pdf-root {
+    position: relative;
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--reader-bg);
-  }
-  .pdf-root.reader {
-    background: var(--elevated-soft);
+    background: color-mix(in srgb, var(--page-bg) 70%, var(--reader-bg));
   }
 
-  .pdf-main {
+  .pdf-scroller {
     flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 1.2rem 0.75rem 40vh;
     display: flex;
     flex-direction: column;
-    min-width: 0;
-    min-height: 0;
+    align-items: center;
+    gap: 18px;
+    overscroll-behavior: contain;
   }
 
-  .pdf-root.reader .canvas-wrap {
-    padding: 0.6rem 0.85rem 0.85rem;
+  .pdf-scroller.single {
+    justify-content: safe center;
+    padding-bottom: 1.2rem;
+  }
+
+  .pdf-row {
+    display: flex;
+    justify-content: center;
+    min-width: min-content;
+  }
+
+  .pdf-zoom {
+    position: absolute;
+    right: 1rem;
+    bottom: 0.8rem;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--toolbar-surface) 92%, transparent);
+    border: 1px solid var(--toolbar-border);
+    box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(12px);
+    opacity: 0.55;
+    transition: opacity 0.2s ease;
+    z-index: 5;
+  }
+
+  .pdf-zoom:hover,
+  .pdf-zoom:focus-within {
+    opacity: 1;
+  }
+
+  .pdf-zoom button {
+    border: none;
+    background: transparent;
+    color: var(--text-soft);
+    min-width: 2rem;
+    height: 2rem;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 1rem;
+  }
+
+  .pdf-zoom button:hover {
+    background: var(--panel-soft);
+  }
+
+  .pdf-zoom .pdf-zoom-val {
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+    padding: 0 0.5rem;
+    color: var(--muted);
   }
 
   .pdf-trans-wrap {
-    justify-content: flex-start;
-    align-items: stretch;
+    flex: 1;
+    overflow: auto;
+    background: var(--rd-bg);
+    color: var(--rd-text);
   }
 
   .pdf-trans-article {
     width: 100%;
-    max-width: 42rem;
+    max-width: var(--rd-measure);
     margin: 0 auto;
-    padding: 0.35rem 0.5rem 1.25rem;
-    box-sizing: border-box;
+    padding: 2rem var(--rd-margin) 3rem;
+    box-sizing: content-box;
   }
 
   .pdf-trans-meta {
-    margin: 0 0 1rem;
+    margin: 0 0 1.2rem;
     font-size: 0.72rem;
     font-weight: 650;
     text-transform: uppercase;
     letter-spacing: 0.12em;
-    color: var(--muted);
+    color: var(--rd-muted);
     font-family: system-ui, sans-serif;
   }
 
   .pdf-trans-body {
-    font-size: 1.02rem;
-    line-height: 1.68;
-    color: var(--text-soft);
+    font-family: var(--rd-font);
+    font-size: var(--rd-size);
+    line-height: var(--rd-line);
     white-space: pre-wrap;
-    font-family: Literata, Georgia, "Times New Roman", serif;
-    text-align: left;
+    text-align: var(--rd-align);
+    hyphens: var(--rd-hyphens);
     user-select: text;
-    cursor: text;
   }
 
   .pdf-trans-err {
@@ -634,175 +868,27 @@
     color: var(--danger);
     line-height: 1.45;
   }
+
   .hint,
   .error {
     margin: auto;
     color: var(--muted);
   }
+
   .error {
     color: var(--danger);
-  }
-  .canvas-wrap {
-    flex: 1;
-    overflow: auto;
-    display: flex;
-    justify-content: center;
     padding: 1rem;
-    min-height: 0;
-  }
-  .page-stack {
-    position: relative;
-    box-shadow: var(--shadow-book);
-    background: #fff;
-    border-radius: 2px;
-  }
-  .page-stack :global(.textLayer) {
-    position: absolute;
-    left: 0;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    overflow: hidden;
-    line-height: 1;
-    opacity: 1;
-    z-index: 2;
-  }
-  .page-stack :global(.textLayer span) {
-    position: absolute;
-    transform-origin: 0 0;
-    white-space: pre;
-    cursor: text;
-    color: transparent;
-  }
-  /* Глобальный ::selection задаёт цвет текста. Для прозрачного слоя PDF это
-     проявляло вторую копию слова поверх отрисованной страницы. */
-  .page-stack :global(.textLayer span:not(.pdf-inline-tr)::selection) {
-    color: transparent;
-  }
-  .page-stack :global(.textLayer span:not(.pdf-inline-tr)::-moz-selection) {
-    color: transparent;
-  }
-  /** Полный перевод: читаемый текст поверх белой подложки (растр страницы без изменений) */
-  .page-stack :global(.textLayer span.pdf-inline-tr) {
-    color: #141414;
-    background: rgba(255, 255, 255, 0.92);
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
-    overflow: hidden;
-    text-overflow: clip;
-  }
-  .page-stack :global(.textLayer br) {
-    color: transparent;
-  }
-  canvas.page {
-    display: block;
-    position: relative;
-    z-index: 1;
-  }
-  .link-layer {
-    position: absolute;
-    left: 0;
-    top: 0;
-    z-index: 3;
-    pointer-events: none;
-  }
-  .link-layer :global(.pdf-link-box) {
-    position: absolute;
-    pointer-events: none;
-  }
-  .link-layer :global(.pdf-link-hit) {
-    display: block;
-    width: 100%;
-    height: 100%;
-    pointer-events: auto;
-    border: none;
-    padding: 0;
-    background: transparent;
-    cursor: pointer;
-  }
-  .link-layer :global(a.pdf-link-hit) {
-    cursor: pointer;
-  }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.55rem 1rem;
-    border-top: 1px solid var(--border-soft);
-    background: var(--panel-soft);
-    flex-shrink: 0;
-  }
-  .toolbar button {
-    min-width: 2.5rem;
-    padding: 0.35rem 0.6rem;
-    border-radius: 10px;
-    border: 1px solid var(--border-soft);
-    background: var(--elevated-soft);
-    color: var(--text);
-    cursor: pointer;
-  }
-  .toolbar button:disabled {
-    opacity: 0.35;
-    cursor: default;
-  }
-  .pages {
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
-    font-size: 0.88rem;
-  }
-  .pages.soft {
-    font-weight: 500;
-    color: var(--text-soft);
-  }
-  .zoom {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.82rem;
-    color: var(--muted);
-  }
-  .zoom-label {
-    min-width: 2.75rem;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
-  .zoom input {
-    width: 120px;
-    accent-color: var(--accent);
+    text-align: center;
   }
 
   @media (max-width: 600px) {
-    .pdf-root.reader .canvas-wrap,
-    .canvas-wrap {
-      padding: 0.45rem 0.35rem 0.6rem;
-      overscroll-behavior: contain;
+    .pdf-scroller {
+      padding: 0.5rem 0.25rem 30vh;
+      gap: 10px;
     }
-
-    .toolbar {
-      flex-wrap: wrap;
-      gap: 0.4rem;
-      padding:
-        0.45rem
-        max(0.55rem, env(safe-area-inset-right))
-        max(0.45rem, env(safe-area-inset-bottom))
-        max(0.55rem, env(safe-area-inset-left));
-    }
-
-    .toolbar button {
-      min-width: 2.75rem;
-      min-height: 2.75rem;
-    }
-
-    .zoom {
-      flex: 1 1 10rem;
-      min-height: 2.75rem;
-    }
-
-    .zoom input {
-      flex: 1;
-      width: auto;
-      min-width: 5rem;
+    .pdf-zoom {
+      right: 0.6rem;
+      bottom: max(0.6rem, env(safe-area-inset-bottom));
     }
   }
 </style>

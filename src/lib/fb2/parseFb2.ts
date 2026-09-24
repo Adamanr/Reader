@@ -258,6 +258,18 @@ function metaFromDescription(root: Element): { bookTitle: string; author: string
   return { bookTitle, author };
 }
 
+/** FB2 часто сохранён в windows-1251: читаем кодировку из XML-пролога. */
+export function decodeFb2Bytes(bytes: Uint8Array): string {
+  const head = new TextDecoder("ascii").decode(bytes.slice(0, 256));
+  const m = /encoding=["']([\w-]+)["']/i.exec(head);
+  const enc = m?.[1]?.toLowerCase() ?? "utf-8";
+  try {
+    return new TextDecoder(enc).decode(bytes);
+  } catch {
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+}
+
 export function parseFb2(xmlString: string): ParsedFb2 {
   const doc = new DOMParser().parseFromString(xmlString, "application/xml");
   const pe = doc.querySelector("parsererror");

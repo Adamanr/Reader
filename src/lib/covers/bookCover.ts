@@ -4,7 +4,7 @@
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
-import { parseFb2 } from "$lib/fb2/parseFb2";
+import { decodeFb2Bytes, parseFb2 } from "$lib/fb2/parseFb2";
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -134,7 +134,7 @@ export async function readBookFileInfo(
   try {
     if (format === "pdf") return await pdfInfo(bytes, wantCover);
     if (format === "epub") return await epubInfo(bytes, wantCover);
-    const xml = new TextDecoder("utf-8").decode(bytes);
+    const xml = decodeFb2Bytes(bytes);
     const parsed = parseFb2(xml);
     const raw = wantCover ? dataUrlFromFb2CoverHtml(parsed.coverHtml) : null;
     return {

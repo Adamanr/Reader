@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
@@ -6,13 +7,16 @@
     BookComment,
     BookMeta,
     EpubReaderApi,
+    Highlight,
+    HighlightColor,
     LibraryMetadata,
     LibrarySnapshot,
     PdfOutlineItem,
     PdfReadyInfo,
-    QuoteAccent,
     QuoteDraftOptions,
     ReaderOutlineItem,
+    ReaderSelection,
+    ReadingPosition,
     SavedQuote,
   } from "$lib/types";
   import PdfViewer from "$lib/components/PdfViewer.svelte";
@@ -21,7 +25,15 @@
   import TypstViewer from "$lib/components/TypstViewer.svelte";
   import TranslationBar from "$lib/components/TranslationBar.svelte";
   import ReaderOutlineTree from "$lib/components/ReaderOutlineTree.svelte";
-  import { ACCENT_CHIP_BG } from "$lib/quoteCardStyles";
+  import ReaderSelectionToolbar from "$lib/components/ReaderSelectionToolbar.svelte";
+  import HighlightPopover from "$lib/components/HighlightPopover.svelte";
+  import CommentDialog from "$lib/components/CommentDialog.svelte";
+  import QuoteDialog from "$lib/components/QuoteDialog.svelte";
+  import TypographyPanel from "$lib/components/TypographyPanel.svelte";
+  import ReaderNotesPanel from "$lib/components/ReaderNotesPanel.svelte";
+  import ReaderSearchPanel from "$lib/components/ReaderSearchPanel.svelte";
+  import ReaderStatusBar from "$lib/components/ReaderStatusBar.svelte";
+  import ReadingRuler from "$lib/components/ReadingRuler.svelte";
   import { getBookFormat } from "$lib/bookFormat";
   import { loadPdfBookTranslationFile } from "$lib/translate/pdfFullBookJob";
   import { exportTranslatedPdfToLibrary } from "$lib/pdf/exportTranslatedPdf";
@@ -32,21 +44,14 @@
     setCachedLibraryMetadata,
   } from "$lib/library/librarySnapshotCache";
   import type { TypstOutlineItem } from "$lib/typst/outlineTypst";
-  import { toastError } from "$lib/ui/toast.svelte";
-
-  const QUOTE_ACCENTS: QuoteAccent[] = ["sand", "sage", "dustyRose", "ink"];
-
-  function quoteAccent(raw: string): QuoteAccent {
-    return QUOTE_ACCENTS.includes(raw as QuoteAccent) ? (raw as QuoteAccent) : "sand";
-  }
-
-  function quoteDetailLine(q: SavedQuote): string {
-    const parts: string[] = [];
-    if (q.includePage) parts.push("страница");
-    if (q.includeChapter) parts.push("глава");
-    parts.push(String(q.layout));
-    return parts.join(" · ");
-  }
+  import { toast, toastError } from "$lib/ui/toast.svelte";
+  import { reading, updateReading } from "$lib/reading/settings.svelte";
+  import { coverAccentVars, coverTone, pagePalette, type CoverTone } from "$lib/reading/palette";
+  import { loadCover } from "$lib/covers/coverCache";
+  import { startSession } from "$lib/reading/stats.svelte";
+  import { bookNotesMarkdown, saveMarkdown } from "$lib/reading/exportNotes";
+  import { writeTextToClipboard } from "$lib/clipboardWrite";
+  import { isTauriRuntime } from "$lib/isTauri";
 
   const bookPath = $derived.by(() => {
     const raw = page.url.searchParams.get("path");
@@ -57,14 +62,14 @@
       return "";
     }
   });
+  const fmt = $derived(bookPath ? getBookFormat(bookPath) : null);
 
   let snapshot = $state<LibrarySnapshot | null>(getCachedLibrarySnapshot());
   let pdfOutline = $state<PdfOutlineItem[]>([]);
   let pdfNumPages = $state(0);
   let navApi = $state<EpubReaderApi | null>(null);
   let pdfPage = $state(1);
-  let pdfScale = $state(1);
-  let tab = $state<"chapters" | "pages" | "notes" | "translate">("chapters");
+  let position = $state<ReadingPosition | null>(null);
   let reviewDraft = $state("");
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let notesPath = $state<string | null>(null);
@@ -79,63 +84,129 @@
   let hasFb2Translation = $state(false);
   /** Полный перевод PDF (LM/Ollama), слой поверх скана */
   let pdfInlineSpans = $state<Record<string, string[]> | null>(null);
-  /** Превью перевода в слое (грубее, чем экспорт PDF). Вкл., чтобы сразу видеть полный перевод. */
   let pdfInlineShow = $state(true);
   let pdfExportBusy = $state(false);
   let typstExportBusy = $state(false);
-  let typstExportBanner = $state<string | null>(null);
   let typstOutline = $state<TypstOutlineItem[]>([]);
   let typstJumpLine = $state<number | null>(null);
-  let readerPanelOpen = $state(false);
 
-  function handleTranslateActivity(e: { busy: boolean; error: string | null }) {
-    transBusy = e.busy;
-    transErr = e.error;
-    if (!e.busy && !e.error && bookPath && getBookFormat(bookPath) === "fb2") {
-      hasFb2Translation = true;
+  // ——— Интерфейс ———
+  type PanelTab = "toc" | "notes" | "search" | "translate";
+  const PANEL_KEY = "reader.panelOpen";
+  let panelOpen = $state(readPanelPref());
+  let panelTab = $state<PanelTab>("toc");
+  let aaOpen = $state(false);
+  let moreOpen = $state(false);
+  let immersive = $state(false);
+  /** В режиме погружения шапка появляется при наведении к верхнему краю */
+  let peek = $state(false);
+  let searchSeed = $state("");
+  let stageEl = $state<HTMLElement | null>(null);
+  let isFullscreen = $state(false);
+
+  // ——— Выделение и заметки ———
+  let selection = $state<ReaderSelection | null>(null);
+  let commentOpen = $state(false);
+  let quoteOpen = $state(false);
+  let quoteText = $state("");
+  let quoteChapter = $state("");
+  let hlPopover = $state<{ id: string; rect: DOMRect; editNote: boolean } | null>(null);
+
+  function narrow(): boolean {
+    return typeof window !== "undefined" && window.matchMedia("(max-width: 1100px)").matches;
+  }
+
+  function readPanelPref(): boolean {
+    try {
+      if (narrow()) return false;
+      return localStorage.getItem(PANEL_KEY) === "1";
+    } catch {
+      return false;
     }
   }
 
-  const meta = $derived(
-    bookPath && snapshot?.metadata.books[bookPath]
-      ? snapshot.metadata.books[bookPath]
-      : null,
-  );
+  function setPanel(open: boolean, tab?: PanelTab) {
+    panelOpen = open;
+    if (tab) panelTab = tab;
+    try {
+      if (!narrow()) localStorage.setItem(PANEL_KEY, open ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }
 
-  const displayTitle = $derived(
-    bookPath
-      ? (meta?.title?.trim() || titleFromPath(bookPath))
-      : "",
-  );
+  function togglePanel(tab: PanelTab) {
+    if (panelOpen && panelTab === tab) setPanel(false);
+    else setPanel(true, tab);
+  }
+
+  const meta = $derived(bookPath && snapshot?.metadata.books[bookPath] ? snapshot.metadata.books[bookPath] : null);
+  const displayTitle = $derived(bookPath ? meta?.title?.trim() || titleFromPath(bookPath) : "");
   const displayAuthor = $derived(meta?.author?.trim() ?? "");
+  const highlights = $derived<Highlight[]>(meta?.highlights ?? []);
 
+  // ——— Палитра страницы и «живая обложка» ———
+  let themeTick = $state(0);
+  let tone = $state<CoverTone | null>(null);
+
+  $effect(() => {
+    const obs = new MutationObserver(() => themeTick++);
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => obs.disconnect();
+  });
+
+  $effect(() => {
+    const p = bookPath;
+    const f = fmt;
+    tone = null;
+    if (!p || !f) return;
+    let alive = true;
+    void loadCover(p, f).then(async (url) => {
+      const t = await coverTone(url);
+      if (alive) tone = t;
+    });
+    return () => {
+      alive = false;
+    };
+  });
+
+  const palette = $derived.by(() => {
+    themeTick;
+    return pagePalette(reading.s.pageTheme, tone);
+  });
+
+  const shellStyle = $derived.by(() => {
+    themeTick;
+    if (!reading.s.livingCover || !tone) return "";
+    const dark = document.documentElement.dataset.theme === "dark";
+    return Object.entries(coverAccentVars(tone, dark))
+      .map(([k, v]) => `${k}:${v}`)
+      .join(";");
+  });
+
+  // ——— Оглавление ———
   const pdfTreeItems = $derived<ReaderOutlineItem[]>(
     pdfOutline.map((item, index) => ({
       id: `pdf-${index}`,
       label: item.title,
       level: item.level,
-      meta: item.page == null ? undefined : `стр. ${item.page}`,
+      meta: item.page == null ? undefined : `${item.page}`,
       disabled: item.page == null,
     })),
   );
 
-  const activePdfOutlineIndex = $derived.by(() => {
+  const activePdfTreeId = $derived.by(() => {
     let found = -1;
     let foundPage = -1;
     for (let index = 0; index < pdfOutline.length; index++) {
-      const page = pdfOutline[index]?.page;
-      if (page != null && page <= pdfPage && page > foundPage) {
+      const pg = pdfOutline[index]?.page;
+      if (pg != null && pg <= pdfPage && pg >= foundPage) {
         found = index;
-        foundPage = page;
+        foundPage = pg;
       }
     }
-    return found;
+    return found >= 0 ? `pdf-${found}` : null;
   });
-
-  const activePdfTreeId = $derived(activePdfOutlineIndex >= 0 ? `pdf-${activePdfOutlineIndex}` : null);
-  const activePdfChapterLabel = $derived(
-    activePdfOutlineIndex >= 0 ? (pdfOutline[activePdfOutlineIndex]?.title ?? "") : "",
-  );
 
   const typstTreeItems = $derived<ReaderOutlineItem[]>(
     typstOutline.map((item, index) => ({
@@ -155,86 +226,47 @@
   );
 
   const activeNavTreeId = $derived.by(() => {
-    const location = meta?.lastReadLocation?.trim();
-    if (!location || !navApi) return null;
-    const locationBase = location.split("#")[0];
-    const index = navApi.toc.findIndex(
-      (item) => item.href === location || item.href.split("#")[0] === locationBase,
-    );
+    if (!navApi) return null;
+    const label = position?.chapterLabel;
+    if (label) {
+      const byLabel = navApi.toc.findIndex((t) => t.label === label);
+      if (byLabel >= 0) return `nav-${byLabel}`;
+    }
+    const href = (meta?.lastReadHref ?? meta?.lastReadLocation ?? "").trim();
+    if (!href) return null;
+    const base = href.split("#")[0];
+    const index = navApi.toc.findIndex((item) => item.href === href || item.href.split("#")[0] === base);
     return index >= 0 ? `nav-${index}` : null;
   });
 
-  function finishChapterNavigation() {
-    if (window.matchMedia("(max-width: 900px)").matches) readerPanelOpen = false;
+  function finishNavigation() {
+    if (narrow()) setPanel(false);
   }
 
   function selectPdfChapter(id: string) {
     const item = pdfOutline[Number(id.replace("pdf-", ""))];
     if (item?.page != null) pdfPage = item.page;
-    finishChapterNavigation();
+    finishNavigation();
   }
 
   function selectTypstChapter(id: string) {
     const item = typstOutline[Number(id.replace("typst-", ""))];
     if (item) typstJumpLine = item.line;
-    finishChapterNavigation();
+    finishNavigation();
   }
 
   function selectNavChapter(id: string) {
     const item = navApi?.toc[Number(id.replace("nav-", ""))];
     if (item) void navApi?.goTo(item.href);
-    finishChapterNavigation();
+    finishNavigation();
   }
-
-  const storageFootnote = $derived.by(() => {
-    const root = snapshot?.libraryRoot?.trim();
-    if (root)
-      return `Корень библиотеки на диске: ${root}. Файл метаданных лежит рядом с каталогом приложения (часто ~/.config/com.adaman.reader/library-metadata.json).`;
-    return "Файл library-metadata.json в каталоге настроек приложения (на Linux обычно ~/.config/com.adaman.reader/).";
-  });
 
   function titleFromPath(path: string) {
     const i = path.lastIndexOf("/");
     return i >= 0 ? path.slice(i + 1) : path;
   }
 
-  async function exportCurrentBookToTypst() {
-    if (!bookPath) return;
-    const fmt = getBookFormat(bookPath);
-    if (!fmt || fmt === "typst") return;
-    typstExportBusy = true;
-    typstExportBanner = null;
-    try {
-      if (!snapshot) throw new Error("Сначала откройте библиотеку.");
-      const { mainRelativePath } = await exportBookToTypst(
-        bookPath,
-        fmt,
-        snapshot,
-        meta?.typstStyleRelativePath,
-      );
-      await loadSnapshot();
-      typstExportBanner = `Создан проект Typst: ${mainRelativePath}`;
-      await goto("/read?path=" + encodeURIComponent(mainRelativePath));
-    } catch (e) {
-      typstExportBanner = e instanceof Error ? e.message : String(e);
-    } finally {
-      typstExportBusy = false;
-    }
-  }
-
-  async function exportPdfTranslation() {
-    if (!bookPath || getBookFormat(bookPath) !== "pdf") return;
-    pdfExportBusy = true;
-    try {
-      await exportTranslatedPdfToLibrary(bookPath);
-      await loadSnapshot();
-    } catch (e) {
-      toastError(e, "Экспорт перевода");
-    } finally {
-      pdfExportBusy = false;
-    }
-  }
-
+  // ——— Данные ———
   async function loadSnapshot() {
     try {
       snapshot = await fetchLibrarySnapshot();
@@ -243,23 +275,18 @@
     }
   }
 
-  async function persist(next: LibraryMetadata) {
-    await invoke("save_library_metadata", { metadata: next });
-    setCachedLibraryMetadata(next);
-    if (snapshot) snapshot = { ...snapshot, metadata: next };
-  }
-
   function patchBook(path: string, patch: Partial<BookMeta>) {
     if (!snapshot) return;
     const cur = snapshot.metadata.books[path];
     if (!cur) return;
     const books = { ...snapshot.metadata.books, [path]: { ...cur, ...patch } };
-    void persist({ ...snapshot.metadata, books });
+    const next: LibraryMetadata = { ...snapshot.metadata, books };
+    setCachedLibraryMetadata(next);
+    snapshot = { ...snapshot, metadata: next };
+    void invoke("save_library_metadata", { metadata: next }).catch((e) => toastError(e, "Сохранение"));
   }
 
-  /** Сбрасываем при уходе со страницы чтения, чтобы при следующем открытии той же книги снова записать время. */
   let lastOpenedPatchKey = $state("");
-
   $effect(() => {
     if (!bookPath) lastOpenedPatchKey = "";
   });
@@ -270,10 +297,14 @@
     if (!p || !snap?.metadata.books[p]) return;
     if (p === lastOpenedPatchKey) return;
     lastOpenedPatchKey = p;
-    patchBook(p, { lastOpenedAt: new Date().toISOString() });
+    const cur = snap.metadata.books[p]!;
+    const patch: Partial<BookMeta> = { lastOpenedAt: new Date().toISOString() };
+    if (!cur.status || cur.status === "want") patch.status = "reading";
+    untrack(() => patchBook(p, patch));
   });
 
   function scheduleReviewSave(path: string, text: string) {
+    reviewDraft = text;
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       patchBook(path, { review: text });
@@ -290,25 +321,59 @@
     navApi = api;
   }
 
-  let locSaveTimer: ReturnType<typeof setTimeout> | null = null;
-  function onReadingLocationSave(p: { location: string; label: string }) {
-    if (!bookPath) return;
-    if (locSaveTimer) clearTimeout(locSaveTimer);
-    locSaveTimer = setTimeout(() => {
-      patchBook(bookPath, {
-        lastReadLocation: p.location,
-        lastReadLocationLabel: p.label,
-      });
-      locSaveTimer = null;
-    }, 500);
+  // ——— Статистика чтения ———
+  let session: ReturnType<typeof startSession> | null = null;
+  $effect(() => {
+    const p = bookPath;
+    if (!p) return;
+    const s = startSession(p);
+    session = s;
+    return () => {
+      s.stop();
+      if (session === s) session = null;
+    };
+  });
+
+  /** Книга дочитана: отмечаем один раз. */
+  function maybeFinish(progress: number | null) {
+    if (progress == null || progress < 0.985 || !bookPath) return;
+    const cur = snapshot?.metadata.books[bookPath];
+    if (!cur || cur.status === "done") return;
+    patchBook(bookPath, { status: "done", finishedAt: new Date().toISOString() });
+    toast("Книга дочитана — поздравляю! ✦", "success");
   }
 
-  /** Восстановить страницу PDF после известного числа страниц */
+  function onPosition(p: ReadingPosition) {
+    position = p;
+    session?.position({ charsLeftBook: p.charsLeftBook, page: fmt === "pdf" ? pdfPage : null });
+  }
+
+  let locSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  function onReadingLocationSave(p: { location: string; label: string; href: string; progress: number | null }) {
+    if (!bookPath) return;
+    const path = bookPath;
+    if (locSaveTimer) clearTimeout(locSaveTimer);
+    locSaveTimer = setTimeout(() => {
+      patchBook(path, {
+        lastReadLocation: p.location,
+        lastReadLocationLabel: p.label,
+        lastReadHref: p.href || null,
+        progress: p.progress,
+      });
+      maybeFinish(p.progress);
+      locSaveTimer = null;
+    }, 600);
+  }
+
   $effect(() => {
     bookPath;
     pdfProgressKey = "";
+    position = null;
+    selection = null;
+    hlPopover = null;
   });
 
+  /** Восстановить страницу PDF, когда известно число страниц */
   $effect(() => {
     const path = bookPath;
     const snap = snapshot;
@@ -317,58 +382,156 @@
     const key = `${path}:${pdfNumPages}`;
     if (pdfProgressKey === key) return;
     const pg = snap.metadata.books[path]?.lastReadPdfPage;
-    if (pg != null && pg >= 1) {
-      pdfPage = Math.min(Math.max(1, Math.round(pg)), pdfNumPages);
-    }
+    if (pg != null && pg >= 1) pdfPage = Math.min(Math.max(1, Math.round(pg)), pdfNumPages);
     pdfProgressKey = key;
   });
 
   let pdfProgTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
     const path = bookPath;
-    const fmt = path ? getBookFormat(path) : null;
     const total = pdfNumPages;
-    const page = pdfPage;
-    if (!path || !snapshot || fmt !== "pdf" || total <= 0) return;
-    if (pdfProgTimer) clearTimeout(pdfProgTimer);
-    pdfProgTimer = setTimeout(() => {
-      patchBook(path, { lastReadPdfPage: page, lastReadPdfTotal: total });
-      pdfProgTimer = null;
-    }, 450);
-    return () => {
+    const pg = pdfPage;
+    if (!path || fmt !== "pdf" || total <= 0 || pdfProgressKey === "") return;
+    untrack(() => {
       if (pdfProgTimer) clearTimeout(pdfProgTimer);
-    };
+      pdfProgTimer = setTimeout(() => {
+        const progress = position?.progress ?? pg / total;
+        patchBook(path, { lastReadPdfPage: pg, lastReadPdfTotal: total, progress });
+        maybeFinish(pg >= total ? 1 : progress);
+        pdfProgTimer = null;
+      }, 500);
+    });
   });
 
-  function addComment(payload: {
-    body: string;
-    excerpt: string;
-    page?: number;
-    chapterLabel?: string;
-  }) {
+  // ——— Выделения ———
+  function onSelection(s: ReaderSelection | null) {
+    selection = s;
+  }
+
+  function addHighlight(color: HighlightColor, note?: string): Highlight | null {
+    const s = selection;
+    if (!s || !bookPath || !meta) return null;
+    const anchor = Object.fromEntries(Object.entries(s.anchor).filter(([, v]) => v != null && v !== ""));
+    const h: Highlight = {
+      id: crypto.randomUUID(),
+      text: s.text.slice(0, 4000),
+      color,
+      createdAt: new Date().toISOString(),
+      ...anchor,
+    };
+    if (note) h.note = note;
+    patchBook(bookPath, { highlights: [...(meta.highlights ?? []), h] });
+    s.clear();
+    selection = null;
+    return h;
+  }
+
+  function updateHighlight(id: string, patch: Partial<Highlight>) {
+    if (!bookPath || !meta) return;
+    const list = (meta.highlights ?? []).map((h) => (h.id === id ? { ...h, ...patch } : h));
+    patchBook(bookPath, { highlights: list });
+  }
+
+  function deleteHighlight(id: string) {
+    if (!bookPath || !meta) return;
+    const path = bookPath;
+    const removed = meta.highlights?.find((h) => h.id === id);
+    patchBook(path, { highlights: (meta.highlights ?? []).filter((h) => h.id !== id) });
+    hlPopover = null;
+    if (removed) {
+      toast("Выделение удалено", "info", {
+        action: {
+          label: "Вернуть",
+          run: () => {
+            const cur = snapshot?.metadata.books[path];
+            if (cur) patchBook(path, { highlights: [...(cur.highlights ?? []), removed] });
+          },
+        },
+      });
+    }
+  }
+
+  function noteFromSelection() {
+    const s = selection;
+    if (!s) return;
+    const r = s.rect;
+    const h = addHighlight("yellow");
+    if (h) hlPopover = { id: h.id, rect: new DOMRect(r.left, r.top, r.width, r.height), editNote: true };
+  }
+
+  function quoteFromSelection() {
+    const s = selection;
+    if (!s) return;
+    quoteText = s.text;
+    quoteChapter = s.anchor.chapterLabel ?? position?.chapterLabel ?? "";
+    quoteOpen = true;
+    s.clear();
+    selection = null;
+  }
+
+  async function copySelection() {
+    const s = selection;
+    if (!s) return;
+    try {
+      await writeTextToClipboard(s.text);
+      toast("Скопировано", "success");
+    } catch {
+      /* ignore */
+    }
+    s.clear();
+    selection = null;
+  }
+
+  function searchSelection() {
+    const s = selection;
+    if (!s) return;
+    searchSeed = s.text.trim().slice(0, 80);
+    s.clear();
+    selection = null;
+    setPanel(true, "search");
+  }
+
+  function onHighlightClick(id: string, rect: DOMRect) {
+    hlPopover = { id, rect, editNote: false };
+  }
+
+  async function goToHighlight(h: Highlight) {
+    const api = navApi;
+    if (!api?.goToHit) return;
+    const len = h.text.length;
+    const hit = { id: h.id, label: "", before: "", match: h.text, after: "" };
+    if (fmt === "pdf" && h.page != null) {
+      await api.goToHit({ ...hit, loc: `p:${h.page}:${h.offset ?? 0}:${len}` });
+    } else if (fmt === "fb2" && h.block != null) {
+      await api.goToHit({ ...hit, loc: `s:${h.block}:${h.offset ?? 0}:${len}` });
+    } else if (h.cfi) {
+      await api.goTo(h.cfi);
+    }
+    finishNavigation();
+  }
+
+  const popHighlight = $derived(hlPopover ? (highlights.find((h) => h.id === hlPopover!.id) ?? null) : null);
+
+  function addComment(body: string) {
     if (!snapshot || !bookPath) return;
     const cur = snapshot.metadata.books[bookPath];
     if (!cur) return;
     const com: BookComment = {
       id: crypto.randomUUID(),
-      body: payload.body,
-      excerpt: payload.excerpt,
+      body,
+      excerpt: quoteText,
       createdAt: new Date().toISOString(),
     };
-    if (payload.page != null) com.page = payload.page;
-    if (payload.chapterLabel) com.chapterLabel = payload.chapterLabel;
-    const comments = [...(cur.comments ?? []), com];
-    patchBook(bookPath, { comments });
+    patchBook(bookPath, { comments: [...(cur.comments ?? []), com] });
   }
 
-  function addQuote(payload: { text: string; options: QuoteDraftOptions }) {
+  function addQuote(o: QuoteDraftOptions) {
     if (!snapshot || !bookPath) return;
     const cur = snapshot.metadata.books[bookPath];
     if (!cur) return;
-    const o = payload.options;
     const quote: SavedQuote = {
       id: crypto.randomUUID(),
-      text: payload.text,
+      text: o.text,
       createdAt: new Date().toISOString(),
       accent: o.accent,
       layout: o.layout,
@@ -385,20 +548,207 @@
     quote.overlayOpacity = o.overlayOpacity;
     quote.bgScale = o.bgScale;
     quote.bgFit = o.bgFit;
-    const quotes = [...(cur.quotes ?? []), quote];
-    patchBook(bookPath, { quotes });
+    patchBook(bookPath, { quotes: [...(cur.quotes ?? []), quote] });
+    toast("Цитата сохранена", "success");
   }
 
+  async function exportNotes() {
+    if (!bookPath || !meta) return;
+    try {
+      const res = await saveMarkdown(displayTitle, bookNotesMarkdown(bookPath, meta));
+      if (res === "saved") toast("Конспект сохранён", "success");
+      else if (res === "copied") toast("Конспект скопирован в буфер", "success");
+    } catch (e) {
+      toastError(e, "Экспорт");
+    }
+  }
 
+  async function copyNotes() {
+    if (!bookPath || !meta) return;
+    await writeTextToClipboard(bookNotesMarkdown(bookPath, meta));
+    toast("Конспект в Markdown скопирован", "success");
+  }
+
+  // ——— Экспорт ———
+  async function exportCurrentBookToTypst() {
+    moreOpen = false;
+    if (!bookPath || !fmt || fmt === "typst") return;
+    typstExportBusy = true;
+    try {
+      if (!snapshot) throw new Error("Сначала откройте библиотеку.");
+      const { mainRelativePath } = await exportBookToTypst(bookPath, fmt, snapshot, meta?.typstStyleRelativePath);
+      await loadSnapshot();
+      toast(`Создан проект Typst: ${mainRelativePath}`, "success");
+      await goto("/read?path=" + encodeURIComponent(mainRelativePath));
+    } catch (e) {
+      toastError(e, "Экспорт в Typst");
+    } finally {
+      typstExportBusy = false;
+    }
+  }
+
+  async function exportPdfTranslation() {
+    if (!bookPath || fmt !== "pdf") return;
+    pdfExportBusy = true;
+    try {
+      await exportTranslatedPdfToLibrary(bookPath);
+      await loadSnapshot();
+      toast("Переведённый PDF сохранён рядом с книгой", "success");
+    } catch (e) {
+      toastError(e, "Экспорт перевода");
+    } finally {
+      pdfExportBusy = false;
+    }
+  }
+
+  function handleTranslateActivity(e: { busy: boolean; error: string | null }) {
+    transBusy = e.busy;
+    transErr = e.error;
+    if (!e.busy && !e.error && fmt === "fb2") hasFb2Translation = true;
+  }
+
+  // ——— Погружение и полноэкранный режим ———
+  function toggleImmersive(force?: boolean) {
+    immersive = force ?? !immersive;
+    peek = false;
+    if (immersive) {
+      aaOpen = false;
+      moreOpen = false;
+      if (narrow()) setPanel(false);
+    }
+  }
+
+  async function toggleFullscreen() {
+    moreOpen = false;
+    try {
+      if (isTauriRuntime()) {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const w = getCurrentWindow();
+        isFullscreen = !(await w.isFullscreen());
+        await w.setFullscreen(isFullscreen);
+      } else if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+        isFullscreen = true;
+      } else {
+        await document.exitFullscreen();
+        isFullscreen = false;
+      }
+      if (isFullscreen) toggleImmersive(true);
+    } catch (e) {
+      toastError(e, "Полный экран");
+    }
+  }
+
+  function onCenterTap() {
+    if (selection) return;
+    toggleImmersive();
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (!immersive) return;
+    const want = e.clientY < 64;
+    if (want !== peek) peek = want;
+  }
+
+  function stepFont(delta: number) {
+    if (fmt === "pdf") {
+      const z = reading.s.pdfFit === "custom" ? reading.s.pdfZoom : 1.2;
+      updateReading({ pdfFit: "custom", pdfZoom: Math.min(5, Math.max(0.3, z * (delta > 0 ? 1.1 : 1 / 1.1))) });
+    } else {
+      updateReading({ fontSize: Math.min(34, Math.max(12, reading.s.fontSize + delta)) });
+    }
+  }
+
+  function typing(t: EventTarget | null) {
+    const el = t as HTMLElement | null;
+    return !!el?.closest?.("input, textarea, select, [contenteditable=true]");
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (typing(e.target)) {
+      if (e.key === "Escape") (e.target as HTMLElement).blur();
+      return;
+    }
+    const api = navApi;
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && (e.key === "f" || e.key === "а")) {
+      e.preventDefault();
+      setPanel(true, "search");
+      return;
+    }
+    if (mod && (e.key === "=" || e.key === "+")) {
+      e.preventDefault();
+      stepFont(1);
+      return;
+    }
+    if (mod && e.key === "-") {
+      e.preventDefault();
+      stepFont(-1);
+      return;
+    }
+    if (mod || e.altKey) return;
+    switch (e.key) {
+      case "ArrowRight":
+      case "PageDown":
+        e.preventDefault();
+        void api?.next();
+        break;
+      case "ArrowLeft":
+      case "PageUp":
+        e.preventDefault();
+        void api?.prev();
+        break;
+      case " ":
+        if (fmt === "fb2" || (fmt === "pdf" && reading.s.pdfMode === "continuous")) return;
+        if (fmt === "epub" && reading.s.epubFlow === "scrolled") return;
+        e.preventDefault();
+        void (e.shiftKey ? api?.prev() : api?.next());
+        break;
+      case "Escape":
+        if (hlPopover) hlPopover = null;
+        else if (aaOpen) aaOpen = false;
+        else if (moreOpen) moreOpen = false;
+        else if (selection) {
+          selection.clear();
+          selection = null;
+        } else if (immersive) toggleImmersive(false);
+        else if (panelOpen && narrow()) setPanel(false);
+        break;
+      case "f":
+      case "а":
+        toggleImmersive();
+        break;
+      case "F11":
+        e.preventDefault();
+        void toggleFullscreen();
+        break;
+      case "t":
+      case "е":
+        togglePanel("toc");
+        break;
+      case "n":
+      case "т":
+        togglePanel("notes");
+        break;
+      case "/":
+        e.preventDefault();
+        setPanel(true, "search");
+        break;
+      case "a":
+      case "ф":
+        aaOpen = !aaOpen;
+        break;
+    }
+  }
+
+  // ——— Жизненный цикл ———
   $effect(() => {
     const path = bookPath;
     if (!snapshot || (path && !snapshot.metadata.books[path])) void loadSnapshot();
   });
 
   $effect(() => {
-    const p = bookPath;
-    const fmt = p ? getBookFormat(p) : null;
-    if (!p || fmt !== "typst") {
+    if (fmt !== "typst") {
       typstOutline = [];
       typstJumpLine = null;
     }
@@ -414,10 +764,7 @@
   });
 
   $effect(() => {
-    const p = bookPath;
-    if (!getBookFormat(p)) {
-      goto("/");
-    }
+    if (!getBookFormat(bookPath)) goto("/");
   });
 
   $effect(() => {
@@ -437,345 +784,298 @@
       }
       try {
         const doc = await loadPdfBookTranslationFile(p);
-        pdfInlineSpans =
-          doc?.pages && Object.keys(doc.pages).length > 0 ? doc.pages : null;
+        pdfInlineSpans = doc?.pages && Object.keys(doc.pages).length > 0 ? doc.pages : null;
       } catch {
         pdfInlineSpans = null;
       }
     })();
   });
+
+  // Возврат в окно (например, после синхронизации) — перечитываем библиотеку.
+  $effect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") void loadSnapshot();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  });
+
+  onDestroy(() => {
+    if (saveTimer) clearTimeout(saveTimer);
+    if (locSaveTimer) clearTimeout(locSaveTimer);
+    if (pdfProgTimer) clearTimeout(pdfProgTimer);
+  });
+
+  const rulerBand = $derived(fmt === "pdf" ? 42 : Math.round(reading.s.fontSize * reading.s.lineHeight * 1.5));
+  const shortSelection = $derived(!!selection && selection.text.length <= 60 && selection.text.split(/\s+/).length <= 5);
 </script>
 
-{#if bookPath && getBookFormat(bookPath)}
-  {@const fmt = getBookFormat(bookPath)!}
-  <div class="read-shell">
+<svelte:window onkeydown={onKeydown} onpointermove={onPointerMove} />
+
+{#if bookPath && fmt}
+  <div
+    class="read-shell"
+    class:immersive
+    class:peek
+    class:panel-open={panelOpen}
+    style={shellStyle}
+    style:--page-bg={palette.bg}
+    style:--chrome-text={palette.text}
+    style:--chrome-muted={palette.muted}
+  >
     <header class="read-top">
-      <div class="read-top-left">
-        <button type="button" class="back" onclick={() => goto("/")}>
-          <span class="back-arr" aria-hidden="true">←</span>
-          <span>Библиотека</span>
-        </button>
-        <a href="/settings" class="settings-link">Настройки</a>
-      </div>
+      <button type="button" class="icon-btn back" onclick={() => goto("/")} title="Библиотека" aria-label="В библиотеку">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" /></svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        class:on={panelOpen && panelTab === "toc"}
+        title="Оглавление (T)"
+        aria-label="Оглавление"
+        onclick={() => togglePanel("toc")}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9" /></svg>
+      </button>
+
       <div class="title-block">
-        <h1 class="read-title">{displayTitle}</h1>
+        <h1 class="read-title" title={displayTitle}>{displayTitle}</h1>
         {#if displayAuthor}
           <p class="read-author">{displayAuthor}</p>
         {/if}
-        {#if typstExportBanner}
-          <p class="typst-export-banner" role="status">{typstExportBanner}</p>
-        {/if}
       </div>
-      <button
-        type="button"
-        class="reader-panel-toggle"
-        aria-expanded={readerPanelOpen}
-        onclick={() => (readerPanelOpen = !readerPanelOpen)}
-      >
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h10" /></svg>
-        <span>Навигация</span>
-      </button>
-      {#if fmt === "pdf" || fmt === "epub" || fmt === "fb2"}
-        <button
-          type="button"
-          class="typst-export-top"
-          onclick={() => void exportCurrentBookToTypst()}
-          disabled={typstExportBusy}
-        >
-          {typstExportBusy ? "Экспорт в Typst…" : "В Typst"}
+
+      <div class="top-actions">
+        {#if fmt !== "typst"}
+          <button
+            type="button"
+            class="icon-btn"
+            class:on={panelOpen && panelTab === "search"}
+            title="Поиск по книге (Ctrl+F)"
+            aria-label="Поиск"
+            onclick={() => togglePanel("search")}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
+          </button>
+          <button
+            type="button"
+            class="icon-btn"
+            class:on={panelOpen && panelTab === "notes"}
+            title="Заметки и выделения (N)"
+            aria-label="Заметки"
+            onclick={() => togglePanel("notes")}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h9l3 3v13H6z" /><path d="M9 11h6M9 15h4" /></svg>
+            {#if highlights.length}<span class="badge">{highlights.length}</span>{/if}
+          </button>
+          <button
+            type="button"
+            class="icon-btn aa"
+            class:on={aaOpen}
+            title="Оформление (A)"
+            aria-label="Оформление"
+            onclick={() => (aaOpen = !aaOpen)}>Aa</button
+          >
+        {/if}
+        <button type="button" class="icon-btn immersive-btn" title="Погружение (F)" aria-label="Режим погружения" onclick={() => toggleImmersive()}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /></svg>
         </button>
-      {/if}
-      {#if (fmt === "epub" || fmt === "fb2") && navApi}
-        {@const api = navApi}
-        <div class="epub-nav">
-          <button type="button" class="mini" onclick={() => void api.prev()} title="Назад">‹</button>
-          <button type="button" class="mini" onclick={() => void api.next()} title="Вперёд">›</button>
+        <div class="more-wrap">
+          <button
+            type="button"
+            class="icon-btn"
+            class:on={moreOpen}
+            title="Ещё"
+            aria-label="Ещё"
+            aria-expanded={moreOpen}
+            onclick={() => (moreOpen = !moreOpen)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.3" /><circle cx="12" cy="12" r="1.3" /><circle cx="19" cy="12" r="1.3" /></svg>
+          </button>
+          {#if moreOpen}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="menu-back" onclick={() => (moreOpen = false)}></div>
+            <div class="menu" role="menu">
+              {#if fmt !== "typst"}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={() => {
+                    moreOpen = false;
+                    setPanel(true, "translate");
+                  }}>Перевод книги…</button
+                >
+              {/if}
+              <button type="button" role="menuitem" onclick={() => void toggleFullscreen()}>
+                {isFullscreen ? "Выйти из полного экрана" : "Во весь экран"} <kbd>F11</kbd>
+              </button>
+              {#if fmt !== "typst"}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={() => {
+                    moreOpen = false;
+                    void exportNotes();
+                  }}>Конспект в Markdown</button
+                >
+                <button type="button" role="menuitem" disabled={typstExportBusy} onclick={() => void exportCurrentBookToTypst()}>
+                  {typstExportBusy ? "Экспорт в Typst…" : "Экспорт в Typst"}
+                </button>
+              {/if}
+              <div class="menu-sep"></div>
+              <a role="menuitem" href="/settings">Настройки</a>
+            </div>
+          {/if}
         </div>
-      {/if}
+      </div>
     </header>
 
     <div class="read-body">
-      <aside class="tabs-panel" class:tabs-panel-open={readerPanelOpen}>
-        <div class="panel-head-mobile">
-          <span>Навигация по книге</span>
-          <button type="button" aria-label="Закрыть навигацию" onclick={() => (readerPanelOpen = false)}>×</button>
-        </div>
-        <div class="tab-row">
-          <button
-            type="button"
-            class="tab"
-            class:active={tab === "chapters"}
-            onclick={() => (tab = "chapters")}>Главы</button>
-          <button
-            type="button"
-            class="tab"
-            class:active={tab === "pages"}
-            onclick={() => (tab = "pages")}>Страницы</button>
-          <button
-            type="button"
-            class="tab"
-            class:active={tab === "translate"}
-            onclick={() => (tab = "translate")}>Перевод</button>
-          <button
-            type="button"
-            class="tab"
-            class:active={tab === "notes"}
-            onclick={() => (tab = "notes")}>Заметки</button>
-        </div>
+      <aside class="side" aria-label="Навигация по книге">
+        <nav class="side-tabs" aria-label="Разделы панели">
+          <button type="button" class:on={panelTab === "toc"} onclick={() => (panelTab = "toc")}>Оглавление</button>
+          {#if fmt !== "typst"}
+            <button type="button" class:on={panelTab === "notes"} onclick={() => (panelTab = "notes")}>Заметки</button>
+            <button type="button" class:on={panelTab === "search"} onclick={() => (panelTab = "search")}>Поиск</button>
+            <button type="button" class:on={panelTab === "translate"} onclick={() => (panelTab = "translate")}>Перевод</button>
+          {/if}
+          <button type="button" class="side-close" aria-label="Закрыть панель" onclick={() => setPanel(false)}>×</button>
+        </nav>
 
-        <div class="tab-body">
-          {#if tab === "chapters"}
-            <div class="scroll-list">
-              {#if fmt === "pdf"}
-                {#if pdfOutline.length === 0}
-                  <p class="empty-hint">Оглавление не найдено или недоступно.</p>
-                {:else}
-                  <ReaderOutlineTree
-                    items={pdfTreeItems}
-                    activeId={activePdfTreeId}
-                    onSelect={selectPdfChapter}
-                  />
-                {/if}
-              {:else if fmt === "typst"}
-                {#if typstOutline.length === 0}
-                  <p class="empty-hint">
-                    Заголовки из <code class="code-in-hint">=</code>, <code class="code-in-hint">==</code>… появятся здесь
-                    после загрузки <strong>book.typ</strong>.
-                  </p>
-                {:else}
-                  <ReaderOutlineTree items={typstTreeItems} onSelect={selectTypstChapter} />
-                {/if}
-              {:else if navApi}
-                {#if navApi.toc.length === 0}
-                  <p class="empty-hint">Оглавление пустое.</p>
-                {:else}
-                  <ReaderOutlineTree
-                    items={navTreeItems}
-                    activeId={activeNavTreeId}
-                    onSelect={selectNavChapter}
-                  />
-                {/if}
-              {:else}
-                <p class="empty-hint">Загрузка…</p>
-              {/if}
-            </div>
-          {:else if tab === "pages"}
-            <div class="scroll-list">
-              {#if fmt === "pdf"}
-                {#if pdfNumPages <= 0}
-                  <p class="empty-hint">Загрузка…</p>
-                {:else}
-                  <div class="page-grid">
-                    {#each Array.from({ length: pdfNumPages }, (_, i) => i + 1) as n (n)}
-                      <button
-                        type="button"
-                        class="page-cell"
-                        class:cur={pdfPage === n}
-                        onclick={() => (pdfPage = n)}>{n}</button>
-                    {/each}
-                  </div>
-                {/if}
-              {:else if fmt === "typst"}
-                <p class="empty-hint typst-pages-hint">
-                  Быстрый предпросмотр — первые ~20 стр.; полная книга — кнопка «Показать всю книгу» на вкладке «Читать».
-                  Поля и разрывы — в <strong>theme.typ</strong> и <code>#pagebreak</code>.
-                </p>
-              {:else if navApi}
-                {#if navApi.spine.length === 0}
-                  <p class="empty-hint">Нет сегментов.</p>
-                {:else}
-                  {#each navApi.spine as seg (seg.href)}
-                    <button type="button" class="list-btn" onclick={() => void navApi?.goTo(seg.href)}>
-                      {seg.label}
-                    </button>
-                  {/each}
-                {/if}
-              {:else}
-                <p class="empty-hint">Загрузка…</p>
-              {/if}
-            </div>
-          {:else if tab === "translate"}
-            <div class="translate-tab">
-              {#if fmt === "typst"}
-                <p class="empty-hint">
-                  Встроенный перевод для Typst не подключён — редактируйте текст в исходнике или экспортируйте снова из
-                  PDF/EPUB/FB2 с нужным языком.
-                </p>
-              {:else}
-                <TranslationBar
-                  compact
-                  format={fmt}
-                  sourceLang={transSource}
-                  targetLang={transTarget}
-                  layout={transLayout}
-                  busy={transBusy}
-                  error={transErr}
-                  hasTranslation={hasFb2Translation}
-                  onSourceChange={(v) => (transSource = v)}
-                  onTargetChange={(v) => (transTarget = v)}
-                  onLayoutChange={(v) => (transLayout = v)}
-                  onRunTranslate={() => {
-                    transRunKey += 1;
+        <div class="side-body">
+          {#if panelTab === "toc"}
+            {#if fmt === "pdf"}
+              {#if pdfNumPages > 0}
+                <form
+                  class="goto"
+                  onsubmit={(e) => {
+                    e.preventDefault();
+                    const v = Number(new FormData(e.currentTarget).get("page"));
+                    if (v >= 1 && v <= pdfNumPages) {
+                      pdfPage = Math.round(v);
+                      finishNavigation();
+                    }
                   }}
-                />
-                {#if fmt === "pdf" && pdfInlineSpans && Object.keys(pdfInlineSpans).length > 0}
-                  <div class="pdf-inline-bar translate-inline">
-                    <button
-                      type="button"
-                      class="pdf-export-btn"
-                      onclick={() => void exportPdfTranslation()}
-                      disabled={pdfExportBusy}>{pdfExportBusy ? "Сборка PDF…" : "Сохранить translate_*.pdf в папку книги"}</button>
-                    <label class="pdf-inline-lab">
-                      <input type="checkbox" bind:checked={pdfInlineShow} />
-                      Превью слоя (грубо)
-                    </label>
-                  </div>
-                {/if}
+                >
+                  <label>
+                    Страница
+                    <input name="page" type="number" min="1" max={pdfNumPages} value={pdfPage} />
+                  </label>
+                  <span>из {pdfNumPages}</span>
+                  <button type="submit">Перейти</button>
+                </form>
               {/if}
-            </div>
-          {:else}
-            <div class="notes-tab">
-              {#if meta}
-                <details class="storage-details">
-                  <summary>Где хранятся заметки и цитаты</summary>
-                  <div class="storage-body">
-                    <p>{storageFootnote}</p>
-                    <p class="storage-second">
-                      Комментарии к выделению и цитаты из «Сделать цитату» попадают туда же.
-                    </p>
-                  </div>
-                </details>
-
-                <p class="notes-hint">
-                  Полку, важность и рецензию — на главной: правая кнопка по книге → «Редактирование».
-                </p>
-
-                {#if (meta.comments?.length ?? 0) > 0}
-                  <section class="mini-block">
-                    <h4>Комментарии к отрывкам</h4>
-                    <ul class="cmt-list">
-                      {#each meta.comments ?? [] as c (c.id)}
-                        <li class="cmt-item">
-                          {#if c.page != null}
-                            <span class="cmt-meta">стр. {c.page}</span>
-                          {:else if c.chapterLabel}
-                            <span class="cmt-meta">{c.chapterLabel}</span>
-                          {/if}
-                          {#if c.excerpt}
-                            <p class="cmt-ex">{c.excerpt}</p>
-                          {/if}
-                          <p class="cmt-body">{c.body}</p>
-                        </li>
-                      {/each}
-                    </ul>
-                  </section>
-                {/if}
-
-                {#if (meta.quotes?.length ?? 0) > 0}
-                  <section class="mini-block">
-                    <h4>Сохранённые цитаты</h4>
-                    <p class="quotes-lead">Список ниже — это те же данные, что в файле метаданных; их можно копировать как PNG из диалога при создании цитаты.</p>
-                    <ul class="quote-card-list">
-                      {#each meta.quotes ?? [] as q (q.id)}
-                        {@const ac = quoteAccent(String(q.accent))}
-                        {@const hasBg = !!(q.bgImageDataUrl && q.bgImageDataUrl.length > 12)}
-                        <li class="quote-card" class:with-bg={hasBg} style:--stripe={ACCENT_CHIP_BG[ac]}>
-                          {#if hasBg}
-                            <div class="quote-card-media" aria-hidden="true">
-                              <div
-                                class="quote-card-media-img"
-                                style:background-image={`url(${q.bgImageDataUrl})`}
-                                style:opacity={q.bgImageOpacity ?? 1}
-                                style:background-size={(q.bgFit === "contain" ? "contain" : "cover")}
-                                style:transform={`scale(${(q.bgScale ?? 100) / 100})`}
-                              ></div>
-                              {#if (q.overlayOpacity ?? 0) > 0.02}
-                                <div
-                                  class="quote-card-media-tint"
-                                  style:background-color={q.overlayColor ?? "#1a1510"}
-                                  style:opacity={q.overlayOpacity ?? 0}
-                                ></div>
-                              {/if}
-                            </div>
-                          {/if}
-                          <div class="quote-card-body">
-                            <p class="quote-card-text">
-                              «{q.text.length > 320 ? `${q.text.slice(0, 320)}…` : q.text}»
-                            </p>
-                            <p class="quote-card-by">
-                              {q.bookTitle?.trim() || displayTitle}
-                              {#if q.bookAuthor?.trim() || displayAuthor}
-                                <span class="quote-card-auth">
-                                  — {q.bookAuthor?.trim() || displayAuthor}
-                                </span>
-                              {/if}
-                            </p>
-                            <p class="quote-card-meta">{quoteDetailLine(q)}</p>
-                          </div>
-                        </li>
-                      {/each}
-                    </ul>
-                  </section>
-                {/if}
-
-                <label class="notes-label">
-                  <span>Заметки к книге</span>
-                  <textarea
-                    rows="14"
-                    placeholder="Мысли, цитаты, заметки…"
-                    bind:value={reviewDraft}
-                    oninput={() => scheduleReviewSave(bookPath, reviewDraft)}
-                  ></textarea>
-                </label>
+              {#if pdfOutline.length === 0}
+                <p class="empty-hint">В этом PDF нет оглавления. Используйте поиск или полосу прогресса внизу.</p>
               {:else}
-                <p class="empty-hint">Метаданные загружаются…</p>
+                <ReaderOutlineTree items={pdfTreeItems} activeId={activePdfTreeId} onSelect={selectPdfChapter} />
+              {/if}
+            {:else if fmt === "typst"}
+              {#if typstOutline.length === 0}
+                <p class="empty-hint">
+                  Заголовки из <code>=</code>, <code>==</code>… появятся здесь после загрузки <strong>book.typ</strong>.
+                </p>
+              {:else}
+                <ReaderOutlineTree items={typstTreeItems} onSelect={selectTypstChapter} />
+              {/if}
+            {:else if navApi}
+              {#if navApi.toc.length === 0}
+                <p class="empty-hint">Оглавление пустое.</p>
+              {:else}
+                <ReaderOutlineTree items={navTreeItems} activeId={activeNavTreeId} onSelect={selectNavChapter} />
+              {/if}
+            {:else}
+              <p class="empty-hint">Загрузка…</p>
+            {/if}
+          {:else if panelTab === "notes"}
+            {#if meta}
+              <ReaderNotesPanel
+                {meta}
+                {displayTitle}
+                {displayAuthor}
+                review={reviewDraft}
+                onReviewInput={(v) => scheduleReviewSave(bookPath, v)}
+                onGoHighlight={(h) => void goToHighlight(h)}
+                onEditHighlight={(h, rect) => (hlPopover = { id: h.id, rect, editNote: false })}
+                onExport={() => void exportNotes()}
+                onCopyMarkdown={() => void copyNotes()}
+              />
+            {:else}
+              <p class="empty-hint">Метаданные загружаются…</p>
+            {/if}
+          {:else if panelTab === "search"}
+            <ReaderSearchPanel api={navApi} initialQuery={searchSeed} onPicked={finishNavigation} />
+          {:else if panelTab === "translate" && fmt !== "typst"}
+            <div class="translate-tab">
+              <TranslationBar
+                compact
+                format={fmt}
+                sourceLang={transSource}
+                targetLang={transTarget}
+                layout={transLayout}
+                busy={transBusy}
+                error={transErr}
+                hasTranslation={hasFb2Translation}
+                onSourceChange={(v) => (transSource = v)}
+                onTargetChange={(v) => (transTarget = v)}
+                onLayoutChange={(v) => (transLayout = v)}
+                onRunTranslate={() => {
+                  transRunKey += 1;
+                }}
+              />
+              {#if fmt === "pdf" && pdfInlineSpans && Object.keys(pdfInlineSpans).length > 0}
+                <div class="pdf-inline-bar">
+                  <button type="button" class="pdf-export-btn" onclick={() => void exportPdfTranslation()} disabled={pdfExportBusy}>
+                    {pdfExportBusy ? "Сборка PDF…" : "Сохранить translate_*.pdf в папку книги"}
+                  </button>
+                  <label class="pdf-inline-lab">
+                    <input type="checkbox" bind:checked={pdfInlineShow} />
+                    Превью слоя перевода
+                  </label>
+                </div>
               {/if}
             </div>
           {/if}
         </div>
       </aside>
 
-      <button
-        type="button"
-        class="reader-backdrop"
-        class:reader-backdrop-open={readerPanelOpen}
-        aria-label="Закрыть навигацию"
-        onclick={() => (readerPanelOpen = false)}
-      ></button>
+      <button type="button" class="side-backdrop" aria-label="Закрыть панель" onclick={() => setPanel(false)}></button>
 
-      <section class="read-stage">
+      <section class="read-stage" bind:this={stageEl}>
         <div class="stage-frame">
           {#if fmt === "pdf"}
             <PdfViewer
               relativePath={bookPath}
-              variant="reader"
               bind:pageNum={pdfPage}
-              bind:scale={pdfScale}
-              onPdfReady={onPdfReady}
-              displayTitle={displayTitle}
-              displayAuthor={displayAuthor}
-              chapterLabel={activePdfChapterLabel}
-              onAddComment={addComment}
-              onAddQuote={addQuote}
+              {palette}
+              {highlights}
+              {onPdfReady}
+              {onPosition}
+              onReaderApi={onReaderNavApi}
+              {onSelection}
+              {onHighlightClick}
+              {onCenterTap}
               pdfTranslationPanel={transLayout === "trans"}
               translateRunKey={transRunKey}
               translateSource={transSource}
               translateTarget={transTarget}
               onTranslateActivity={handleTranslateActivity}
-              pdfInlineSpans={pdfInlineSpans}
-              pdfInlineShow={pdfInlineShow}
+              {pdfInlineSpans}
+              {pdfInlineShow}
             />
           {:else if fmt === "epub"}
             <EpubViewer
               relativePath={bookPath}
-              variant="reader"
               initialLocation={meta?.lastReadLocation ?? ""}
+              {palette}
+              {highlights}
               onReadingProgress={onReadingLocationSave}
+              {onPosition}
               onReaderApi={onReaderNavApi}
-              displayTitle={displayTitle}
-              displayAuthor={displayAuthor}
-              onAddComment={addComment}
-              onAddQuote={addQuote}
+              {onSelection}
+              {onHighlightClick}
+              {onCenterTap}
               translateRunKey={transRunKey}
               translateSource={transSource}
               translateTarget={transTarget}
@@ -785,7 +1085,7 @@
           {:else if fmt === "typst"}
             <TypstViewer
               relativePath={bookPath}
-              displayTitle={displayTitle}
+              {displayTitle}
               onOutline={(o) => (typstOutline = o)}
               goToLineRequest={typstJumpLine}
               onGoToLineHandled={() => (typstJumpLine = null)}
@@ -793,14 +1093,15 @@
           {:else}
             <Fb2Viewer
               relativePath={bookPath}
-              variant="reader"
               initialLocation={meta?.lastReadLocation ?? ""}
+              {palette}
+              {highlights}
               onReadingProgress={onReadingLocationSave}
+              {onPosition}
               onReaderApi={onReaderNavApi}
-              displayTitle={displayTitle}
-              displayAuthor={displayAuthor}
-              onAddComment={addComment}
-              onAddQuote={addQuote}
+              {onSelection}
+              {onHighlightClick}
+              {onCenterTap}
               translateRunKey={transRunKey}
               translateSource={transSource}
               translateTarget={transTarget}
@@ -808,14 +1109,73 @@
               onTranslateActivity={handleTranslateActivity}
             />
           {/if}
+          {#if reading.s.focus === "line" && fmt !== "typst"}
+            <ReadingRuler host={stageEl} band={rulerBand} tint={palette.bg} />
+          {/if}
         </div>
+        {#if fmt !== "typst"}
+          <ReaderStatusBar {position} quiet={immersive} onSeek={(f) => void navApi?.seek?.(f)} />
+        {/if}
       </section>
     </div>
   </div>
+
+  {#if aaOpen}
+    <TypographyPanel format={fmt} onClose={() => (aaOpen = false)} />
+  {/if}
+
+  <ReaderSelectionToolbar
+    visible={!!selection && !hlPopover && !quoteOpen}
+    rect={selection?.rect ?? null}
+    short={shortSelection}
+    onHighlight={(c) => void addHighlight(c)}
+    onNote={noteFromSelection}
+    onQuote={quoteFromSelection}
+    onCopy={() => void copySelection()}
+    onSearch={searchSelection}
+  />
+
+  {#if hlPopover && popHighlight}
+    <HighlightPopover
+      highlight={popHighlight}
+      rect={hlPopover.rect}
+      editNote={hlPopover.editNote}
+      onChange={(p) => updateHighlight(popHighlight.id, p)}
+      onDelete={() => deleteHighlight(popHighlight.id)}
+      onQuote={() => {
+        quoteText = popHighlight.text;
+        quoteChapter = popHighlight.chapterLabel ?? "";
+        hlPopover = null;
+        quoteOpen = true;
+      }}
+      onClose={() => (hlPopover = null)}
+    />
+  {/if}
+
+  <CommentDialog
+    open={commentOpen}
+    excerpt={quoteText}
+    pageHint={position?.chapterLabel ?? ""}
+    onClose={() => (commentOpen = false)}
+    onSave={addComment}
+  />
+
+  <QuoteDialog
+    open={quoteOpen}
+    {quoteText}
+    bookTitle={displayTitle}
+    bookAuthor={displayAuthor}
+    pageLabel={fmt === "pdf" ? `стр. ${pdfPage}` : ""}
+    chapterLabel={quoteChapter}
+    onClose={() => (quoteOpen = false)}
+    onSave={addQuote}
+  />
 {/if}
 
 <style>
   .read-shell {
+    --side-w: 21rem;
+    --top-h: 3.4rem;
     display: flex;
     flex-direction: column;
     height: 100vh;
@@ -823,927 +1183,441 @@
     min-height: 0;
     position: relative;
     isolation: isolate;
-    background:
-      radial-gradient(circle at 95% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 28rem),
-      var(--reader-bg);
+    background: var(--page-bg);
+    transition: background 0.4s ease;
+  }
+
+  .read-shell::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: radial-gradient(ellipse 60rem 22rem at 50% -8rem, var(--cover-glow, transparent), transparent 70%);
+  }
+
+  /* ——— Шапка ——— */
+  .read-top {
+    height: var(--top-h);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: env(safe-area-inset-top) 0.6rem 0;
+    box-sizing: content-box;
+    border-bottom: 1px solid color-mix(in srgb, var(--chrome-muted) 18%, transparent);
+    background: color-mix(in srgb, var(--page-bg) 86%, transparent);
+    backdrop-filter: blur(14px) saturate(1.1);
+    z-index: 50;
+    transition:
+      transform 0.28s ease,
+      opacity 0.28s ease;
+  }
+
+  .immersive .read-top {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    transform: translateY(-110%);
+    opacity: 0;
+  }
+
+  .immersive.peek .read-top {
+    transform: none;
+    opacity: 1;
+    box-shadow: var(--shadow-soft);
+  }
+
+  .icon-btn {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-width: 2.3rem;
+    height: 2.3rem;
+    padding: 0 0.35rem;
+    border-radius: 12px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--chrome-text);
+    cursor: pointer;
+    transition:
+      background 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .icon-btn:hover {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
+  .icon-btn.on {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+    color: var(--chrome-text);
+  }
+
+  .icon-btn svg {
+    width: 1.2rem;
+    height: 1.2rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .icon-btn.aa {
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: 1.05rem;
+    font-weight: 500;
+  }
+
+  .badge {
+    position: absolute;
+    top: 0.1rem;
+    right: 0.05rem;
+    min-width: 1rem;
+    height: 1rem;
+    padding: 0 0.2rem;
+    border-radius: 999px;
+    background: var(--accent-2);
+    color: var(--page-bg);
+    font-size: 0.6rem;
+    font-weight: 700;
+    line-height: 1rem;
+  }
+
+  .title-block {
+    flex: 1;
+    min-width: 0;
+    text-align: center;
+    padding: 0 0.5rem;
+  }
+
+  .read-title {
+    margin: 0;
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--chrome-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .read-author {
+    margin: 0;
+    font-size: 0.74rem;
+    color: var(--chrome-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .top-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.15rem;
+  }
+
+  .more-wrap {
+    position: relative;
+  }
+
+  .menu-back {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+  }
+
+  .menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.4rem);
+    z-index: 61;
+    min-width: 15rem;
+    display: flex;
+    flex-direction: column;
+    padding: 0.35rem;
+    border-radius: var(--radius-md);
+    background: var(--panel-elevated);
+    border: 1px solid var(--toolbar-border);
+    box-shadow: var(--shadow-float);
+    animation: pop 0.14s ease-out;
+  }
+
+  .menu button,
+  .menu a {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text-soft);
+    padding: 0.55rem 0.7rem;
+    border-radius: 10px;
+    font-size: 0.86rem;
+    cursor: pointer;
+    text-decoration: none;
+  }
+
+  .menu button:hover,
+  .menu a:hover {
+    background: var(--panel-soft);
+  }
+
+  .menu button:disabled {
+    opacity: 0.5;
+  }
+
+  .menu kbd {
+    font-size: 0.68rem;
+    color: var(--muted);
+    font-family: inherit;
+  }
+
+  .menu-sep {
+    height: 1px;
+    margin: 0.3rem 0.4rem;
+    background: var(--border-soft);
+  }
+
+  /* ——— Тело ——— */
+  .read-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    position: relative;
+  }
+
+  .side {
+    width: 0;
+    flex-shrink: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    background: color-mix(in srgb, var(--panel-soft) 70%, var(--page-bg));
+    border-right: 1px solid transparent;
+    transition:
+      width 0.26s ease,
+      border-color 0.26s ease;
+  }
+
+  .panel-open .side {
+    width: var(--side-w);
+    border-right-color: color-mix(in srgb, var(--border-soft) 70%, transparent);
+  }
+
+  .side-tabs {
+    display: flex;
+    align-items: center;
+    gap: 0.15rem;
+    padding: 0.55rem 0.6rem 0.4rem;
+    min-width: var(--side-w);
+    box-sizing: border-box;
+  }
+
+  .side-tabs button {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    padding: 0.35rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .side-tabs button.on {
+    background: var(--elevated-soft);
+    color: var(--text-soft);
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  }
+
+  .side-tabs .side-close {
+    margin-left: auto;
+    font-size: 1.2rem;
+    line-height: 1;
+    display: none;
+  }
+
+  .side-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 0.5rem 0.8rem 1.5rem;
+    min-width: var(--side-w);
+    box-sizing: border-box;
+  }
+
+  .side-backdrop {
+    display: none;
+  }
+
+  .goto {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.8rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+
+  .goto label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .goto input {
+    width: 4.2rem;
+    border: 1px solid var(--border-soft);
+    background: var(--elevated-soft);
+    color: var(--text-soft);
+    border-radius: 8px;
+    padding: 0.3rem 0.4rem;
+    font: inherit;
+  }
+
+  .goto button {
+    margin-left: auto;
+    border: 1px solid var(--border-soft);
+    background: var(--elevated-soft);
+    color: var(--text-soft);
+    border-radius: 999px;
+    padding: 0.25rem 0.65rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+
+  .empty-hint {
+    margin: 0.5rem 0;
+    font-size: 0.84rem;
+    line-height: 1.5;
+    color: var(--muted);
   }
 
   .translate-tab {
     display: flex;
     flex-direction: column;
-    gap: 0.45rem;
-    min-height: 0;
-    padding-bottom: 0.35rem;
-  }
-
-  .pdf-inline-bar.translate-inline {
-    border-bottom: none;
-    margin: 0;
+    gap: 0.6rem;
   }
 
   .pdf-inline-bar {
-    flex-shrink: 0;
-    padding: 0.35rem clamp(0.65rem, 2vw, 1rem);
-    font-size: 0.84rem;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border-soft);
-    background: color-mix(in srgb, var(--accent) 4%, var(--elevated-soft));
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.65rem 1rem;
+    flex-direction: column;
+    gap: 0.45rem;
   }
 
   .pdf-export-btn {
-    padding: 0.35rem 0.75rem;
-    border-radius: var(--radius-sm);
-    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border-soft));
-    background: color-mix(in srgb, var(--accent) 14%, var(--elevated-soft));
+    border: 1px solid var(--border-soft);
+    background: var(--elevated-soft);
     color: var(--text-soft);
-    font-size: 0.82rem;
-    font-weight: 600;
+    border-radius: var(--radius-sm);
+    padding: 0.5rem 0.65rem;
+    font-size: 0.8rem;
     cursor: pointer;
-    font-family: system-ui, sans-serif;
-  }
-
-  .pdf-export-btn:disabled {
-    opacity: 0.55;
-    cursor: default;
+    text-align: left;
   }
 
   .pdf-inline-lab {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: 0.45rem;
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .read-top {
-    display: flex;
-    align-items: center;
-    gap: 0.65rem 1rem;
-    min-height: 4.2rem;
-    padding: 0.6rem clamp(0.75rem, 3vw, 1.3rem);
-    border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 82%, transparent);
-    background: color-mix(in srgb, var(--panel-veil) 96%, transparent);
-    backdrop-filter: blur(16px) saturate(1.15);
-    box-shadow: 0 1px 0 color-mix(in srgb, var(--elevated-soft) 65%, transparent);
-    flex-shrink: 0;
-    flex-wrap: wrap;
-    row-gap: 0.45rem;
-  }
-
-  .read-top-left {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.35rem 0.75rem;
-    flex-shrink: 0;
-  }
-
-  .settings-link {
-    font-size: 0.83rem;
-    color: var(--muted);
-    text-decoration: none;
-    font-weight: 550;
-    padding: 0.45rem 0.65rem;
-    border-radius: var(--radius-sm);
-    font-family: system-ui, sans-serif;
-  }
-
-  .settings-link:hover {
-    color: var(--accent-2);
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    border: none;
-    background: transparent;
-    color: var(--accent-2);
-    min-height: 2.35rem;
-    padding: 0.45rem 0.65rem;
-    margin-left: -0.35rem;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    font-size: 0.83rem;
-    font-weight: 550;
-    flex-shrink: 0;
-    font-family: system-ui, sans-serif;
-  }
-
-  .back-arr {
-    opacity: 0.85;
-    font-size: 1rem;
-  }
-
-  .back:hover {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-    color: var(--text-soft);
-  }
-
-  .title-block {
-    flex: 1 1 12rem;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.12rem;
-    padding-left: clamp(0rem, 1vw, 0.65rem);
-  }
-
-  .read-title {
-    margin: 0;
-    font-size: clamp(1rem, 3.5vw, 1.18rem);
-    font-weight: 750;
-    letter-spacing: -0.02em;
-    color: var(--text-soft);
-    line-height: 1.25;
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-  }
-
-  .read-author {
-    margin: 0;
-    font-size: clamp(0.74rem, 2.5vw, 0.8rem);
-    color: var(--muted);
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 1;
-    line-clamp: 1;
-    font-family: system-ui, sans-serif;
-  }
-
-  .typst-export-banner {
-    margin: 0.25rem 0 0;
-    font-size: 0.78rem;
-    color: var(--muted);
-    line-height: 1.35;
-    max-width: 40rem;
-  }
-
-  .typst-export-top {
-    flex-shrink: 0;
-    align-self: center;
-    min-height: 2.35rem;
-    padding: 0.45rem 0.9rem;
-    border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-soft));
-    background: color-mix(in srgb, var(--accent) 10%, var(--elevated-soft));
-    color: var(--text-soft);
-    font-size: 0.82rem;
-    font-weight: 600;
-    cursor: pointer;
-    font-family: system-ui, sans-serif;
-  }
-
-  .typst-export-top:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-
-  .code-in-hint {
-    font-size: 0.9em;
-    font-family: ui-monospace, monospace;
-  }
-
-  .epub-nav {
-    display: flex;
-    gap: 0.35rem;
-    flex-shrink: 0;
-  }
-
-  .reader-panel-toggle {
-    display: none;
-    align-items: center;
-    justify-content: center;
-    gap: 0.4rem;
-    min-height: 2.35rem;
-    padding: 0.45rem 0.75rem;
-    border: 1px solid var(--border-soft);
-    border-radius: 999px;
-    background: var(--elevated-soft);
-    color: var(--text-soft);
-    cursor: pointer;
     font-size: 0.8rem;
-    font-weight: 650;
-  }
-
-  .reader-panel-toggle svg {
-    width: 1rem;
-    height: 1rem;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.8;
-    stroke-linecap: round;
-  }
-
-  .panel-head-mobile,
-  .reader-backdrop {
-    display: none;
-  }
-
-  .mini {
-    width: 2.25rem;
-    height: 2.25rem;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-soft);
-    background: var(--panel-soft);
-    color: var(--text);
-    cursor: pointer;
-    font-size: 1.15rem;
-    line-height: 1;
-  }
-
-  .mini:hover {
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--border-soft));
-    background: var(--elevated-soft);
-  }
-
-  .read-body {
-    flex: 1;
-    display: grid;
-    grid-template-columns: minmax(min(100%, 240px), 272px) 1fr;
-    min-height: 0;
-  }
-
-  .tabs-panel {
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--border-soft);
-    background: color-mix(in srgb, var(--elevated-soft) 66%, var(--panel-soft));
-    min-height: 0;
-    box-shadow: 7px 0 28px color-mix(in srgb, var(--text-soft) 4%, transparent);
-    z-index: 2;
-  }
-
-  .tab-row {
-    display: flex;
-    flex-shrink: 0;
-    gap: 0;
-    padding: 0.45rem 0.5rem 0;
-    border-bottom: 1px solid var(--border-soft);
-    background: var(--elevated-soft);
-  }
-
-  .tab {
-    flex: 1;
-    padding: 0.6rem 0.32rem 0.68rem;
-    font-size: 0.76rem;
-    border: none;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-    background: transparent;
     color: var(--muted);
-    cursor: pointer;
-    font-weight: 550;
-    font-family: system-ui, sans-serif;
-    letter-spacing: 0.02em;
-    transition: color 0.12s ease, border-color 0.12s ease;
-  }
-
-  .tab:hover {
-    color: var(--text-soft);
-  }
-
-  .tab.active {
-    color: var(--accent-2);
-    border-bottom-color: color-mix(in srgb, var(--accent) 65%, var(--accent-2));
-    font-weight: 650;
-    background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--accent) 7%, transparent));
-  }
-
-  .tab-body {
-    flex: 1;
-    min-height: 0;
-    background: color-mix(in srgb, var(--panel-soft) 35%, var(--elevated-soft));
-    display: flex;
-    flex-direction: column;
-  }
-
-  .scroll-list {
-    flex: 1;
-    overflow-y: auto;
-    padding: 0.65rem 0.65rem 0.85rem;
-    min-height: 0;
-  }
-
-  .empty-hint {
-    margin: 0.65rem 0.35rem;
-    font-size: 0.85rem;
-    color: var(--muted);
-    line-height: 1.5;
-  }
-
-  .list-btn {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 0.55rem;
-    width: 100%;
-    text-align: left;
-    padding: 0.62rem 0.65rem;
-    margin-bottom: 0.35rem;
-    border-radius: var(--radius-md);
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--text-soft);
-    cursor: pointer;
-    font-size: 0.81rem;
-    line-height: 1.38;
-    transition: background 0.1s ease;
-  }
-
-  .list-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 7%, var(--elevated-soft));
-    border-color: color-mix(in srgb, var(--border-soft) 80%, transparent);
-  }
-
-  .list-btn:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  .page-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(2.35rem, 1fr));
-    gap: 0.4rem;
-  }
-
-  .page-cell {
-    padding: 0.38rem 0.15rem;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border-soft);
-    background: var(--elevated-soft);
-    color: var(--text-soft);
-    font-size: 0.76rem;
-    cursor: pointer;
-    font-variant-numeric: tabular-nums;
-    transition:
-      border-color 0.1s ease,
-      background 0.1s ease;
-  }
-
-  .page-cell:hover {
-    border-color: color-mix(in srgb, var(--accent) 38%, var(--border-soft));
-  }
-
-  .page-cell.cur {
-    background: color-mix(in srgb, var(--accent) 16%, var(--elevated-soft));
-    border-color: color-mix(in srgb, var(--accent) 48%, var(--border-soft));
-    font-weight: 650;
-    color: var(--accent-2);
-  }
-
-  .notes-tab {
-    padding: 0.75rem 0.85rem 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    overflow-y: auto;
-    flex: 1;
-    min-height: 0;
-  }
-
-  .storage-details {
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-soft);
-    background: var(--elevated-soft);
-    font-size: 0.8rem;
-    line-height: 1.45;
-    color: var(--text-soft);
-  }
-
-  .storage-details summary {
-    padding: 0.55rem 0.65rem;
-    cursor: pointer;
-    font-weight: 600;
-    font-size: 0.78rem;
-    font-family: system-ui, sans-serif;
-    color: var(--muted);
-    list-style: none;
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-  }
-
-  .storage-details summary::-webkit-details-marker {
-    display: none;
-  }
-
-  .storage-details summary::before {
-    content: "";
-    width: 0.35rem;
-    height: 0.35rem;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--accent) 55%, var(--accent-2));
-    flex-shrink: 0;
-  }
-
-  .storage-details[open] summary {
-    color: var(--accent-2);
-    border-bottom: 1px solid var(--border-soft);
-  }
-
-  .storage-body {
-    padding: 0.55rem 0.7rem 0.65rem;
-  }
-
-  .storage-body p {
-    margin: 0;
-  }
-
-  .storage-second {
-    margin-top: 0.45rem !important;
-    color: var(--muted) !important;
-    font-size: 0.78rem !important;
-  }
-
-  .notes-hint {
-    margin: 0;
-    font-size: 0.8rem;
-    line-height: 1.45;
-    color: var(--muted);
-  }
-
-  .quotes-lead {
-    margin: 0 0 0.55rem;
-    font-size: 0.76rem;
-    line-height: 1.45;
-    color: var(--muted);
-  }
-
-  .quote-card-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.55rem;
-    max-height: min(42vh, 320px);
-    overflow-y: auto;
-    padding-right: 2px;
-  }
-
-  .quote-card {
-    position: relative;
-    padding: 0.55rem 0.65rem 0.55rem 0.85rem;
-    border-radius: var(--radius-md);
-    border: 1px solid color-mix(in srgb, var(--border-soft) 92%, transparent);
-    background: var(--elevated-soft);
-    overflow: hidden;
-  }
-
-  .quote-card.with-bg .quote-card-text,
-  .quote-card.with-bg .quote-card-by {
-    text-shadow: 0 1px 10px color-mix(in srgb, var(--elevated-soft) 85%, transparent);
-  }
-
-  .quote-card-media {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    overflow: hidden;
-    border-radius: inherit;
-  }
-
-  .quote-card-media-img {
-    position: absolute;
-    inset: 0;
-    background-position: center center;
-    background-repeat: no-repeat;
-    transform-origin: center center;
-  }
-
-  .quote-card-media-tint {
-    position: absolute;
-    inset: 0;
-  }
-
-  .quote-card-body {
-    position: relative;
-    z-index: 1;
-  }
-
-  .quote-card::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 4px;
-    background: var(--stripe);
-    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-  }
-
-  .quote-card-text {
-    margin: 0 0 0.4rem;
-    font-size: 0.84rem;
-    line-height: 1.45;
-    color: var(--text-soft);
-    font-family: Georgia, "Times New Roman", serif;
-  }
-
-  .quote-card-by {
-    margin: 0;
-    font-size: 0.76rem;
-    font-weight: 600;
-    color: var(--text-soft);
-    font-family: system-ui, sans-serif;
-  }
-
-  .quote-card-auth {
-    font-weight: 500;
-    color: var(--muted);
-  }
-
-  .quote-card-meta {
-    margin: 0.35rem 0 0;
-    font-size: 0.7rem;
-    color: var(--muted);
-    letter-spacing: 0.02em;
-  }
-
-  .mini-block {
-    margin-bottom: 0.85rem;
-  }
-
-  .mini-block h4 {
-    margin: 0 0 0.4rem;
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--muted);
-    font-family: system-ui, sans-serif;
-  }
-
-  .cmt-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    max-height: min(36vh, 260px);
-    overflow-y: auto;
-    padding-right: 2px;
-  }
-
-  .cmt-item {
-    padding: 0.5rem 0.6rem;
-    border-radius: var(--radius-md);
-    border: 1px solid color-mix(in srgb, var(--border-soft) 90%, transparent);
-    background: color-mix(in srgb, var(--elevated-soft) 88%, var(--panel-soft));
-    font-size: 0.82rem;
-    line-height: 1.35;
-    box-shadow: 0 4px 14px rgba(61, 56, 51, 0.05);
-  }
-
-  .cmt-meta {
-    display: block;
-    font-size: 0.72rem;
-    color: var(--accent-2);
-    margin-bottom: 0.25rem;
-    font-weight: 600;
-  }
-
-  .cmt-ex {
-    margin: 0 0 0.35rem;
-    font-size: 0.78rem;
-    color: var(--muted);
-    font-style: italic;
-  }
-
-  .cmt-body {
-    margin: 0;
-    white-space: pre-wrap;
-  }
-
-  .notes-label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    font-size: 0.75rem;
-    color: var(--muted);
-    flex: 1;
-    min-height: 0;
-  }
-
-  .notes-label textarea {
-    flex: 1;
-    min-height: 12rem;
-    padding: 0.55rem 0.6rem;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-soft);
-    background: var(--panel-soft);
-    color: var(--text);
-    font-size: 0.9rem;
-    line-height: 1.45;
-    resize: vertical;
   }
 
   .read-stage {
+    flex: 1;
     min-width: 0;
     min-height: 0;
     display: flex;
     flex-direction: column;
-    padding: clamp(0.65rem, 1.8vw, 1.15rem);
-    background: transparent;
+    position: relative;
   }
 
   .stage-frame {
     flex: 1;
     min-height: 0;
+    position: relative;
     display: flex;
     flex-direction: column;
-    border-radius: var(--radius-xl);
-    border: 1px solid color-mix(in srgb, var(--border-soft) 88%, #c9bfb4);
-    background: var(--elevated-soft);
-    box-shadow: var(--shadow-book);
-    overflow: hidden;
   }
 
-  /* Dreamcore reader chrome: the book remains the visual focus. */
-  .read-shell {
-    background:
-      radial-gradient(circle at 92% 7%, color-mix(in srgb, #fff2bf 45%, transparent) 0 3.4rem, transparent 3.55rem),
-      radial-gradient(ellipse 30rem 18rem at 2% 0%, color-mix(in srgb, var(--accent) 21%, transparent), transparent 68%),
-      radial-gradient(ellipse 28rem 18rem at 100% 100%, color-mix(in srgb, #b8d7ef 16%, transparent), transparent 70%),
-      var(--reader-bg);
+  .stage-frame > :global(*:not(.ruler)) {
+    flex: 1;
+    min-height: 0;
   }
 
-  .read-top {
-    min-height: 4.6rem;
-    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-    background: color-mix(in srgb, var(--panel-veil) 80%, transparent);
-    backdrop-filter: blur(24px) saturate(1.18);
-    box-shadow: none;
-  }
-
-  .back,
-  .settings-link,
-  .typst-export-top,
-  .reader-panel-toggle,
-  .mini {
-    border-radius: 999px;
-  }
-
-  .back {
-    margin-left: 0;
-    border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border-soft));
-    background: color-mix(in srgb, var(--elevated-soft) 54%, transparent);
-  }
-
-  .read-title {
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: clamp(1.08rem, 3.5vw, 1.35rem);
-    font-weight: 500;
-    letter-spacing: -0.035em;
-  }
-
-  .tabs-panel {
-    border-color: color-mix(in srgb, var(--accent) 16%, var(--border-soft));
-    background: color-mix(in srgb, var(--panel-elevated) 68%, transparent);
-    box-shadow: 10px 0 45px color-mix(in srgb, var(--accent-2) 6%, transparent);
-    backdrop-filter: blur(20px);
-  }
-
-  .tab-row {
-    gap: 0.25rem;
-    padding: 0.55rem;
-    border-color: color-mix(in srgb, var(--accent) 14%, var(--border-soft));
-    background: transparent;
-  }
-
-  .tab {
-    margin: 0;
-    padding: 0.58rem 0.25rem;
-    border: 0;
-    border-radius: 0.75rem;
-  }
-
-  .tab.active {
-    border: 0;
-    background: color-mix(in srgb, var(--accent) 15%, var(--elevated-soft));
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 15%, transparent);
-  }
-
-  .tab-body {
-    background: transparent;
-  }
-
-  .list-btn,
-  .cmt-item,
-  .quote-card {
-    border-color: color-mix(in srgb, var(--accent) 15%, var(--border-soft));
-    background: color-mix(in srgb, var(--elevated-soft) 58%, transparent);
-  }
-
-  .notes-label textarea {
-    border-color: color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-    border-radius: 1rem;
-    background: color-mix(in srgb, var(--elevated-soft) 72%, transparent);
-  }
-
-  .stage-frame {
-    border-color: color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-    border-radius: 1.75rem;
-    box-shadow: 0 24px 72px color-mix(in srgb, var(--accent-2) 10%, transparent);
-  }
-
-  @media (max-width: 900px) {
-    .read-body {
-      grid-template-columns: 1fr;
-      grid-template-rows: minmax(0, 1fr);
-    }
-
-    .tabs-panel {
-      position: fixed;
-      inset: 0 auto 0 0;
-      z-index: 70;
-      width: min(90vw, 22rem);
-      border-right: 1px solid var(--border-soft);
-      border-bottom: none;
-      box-shadow: var(--shadow-float);
-      transform: translateX(-104%);
-      visibility: hidden;
-      transition: transform 0.24s cubic-bezier(0.33, 1, 0.68, 1), visibility 0.24s;
-      padding-top: env(safe-area-inset-top);
-      padding-bottom: env(safe-area-inset-bottom);
-      overscroll-behavior: contain;
-    }
-
-    .tabs-panel-open {
-      transform: translateX(0);
-      visibility: visible;
-    }
-
-    .reader-panel-toggle {
-      display: inline-flex;
-    }
-
-    .panel-head-mobile {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      min-height: 3.8rem;
-      padding: 0.7rem 0.85rem 0.55rem 1rem;
-      color: var(--text-soft);
-      font-size: 0.9rem;
-      font-weight: 700;
-    }
-
-    .panel-head-mobile button {
-      display: grid;
-      place-items: center;
-      width: 2.75rem;
-      height: 2.75rem;
-      padding: 0;
-      border: 0;
-      border-radius: 999px;
-      background: var(--panel-soft);
-      color: var(--muted);
-      cursor: pointer;
-      font-size: 1.3rem;
-    }
-
-    .reader-backdrop {
-      position: fixed;
-      inset: 0;
-      z-index: 65;
-      border: 0;
-      background: color-mix(in srgb, #111 42%, transparent);
-      backdrop-filter: blur(3px);
+  @keyframes pop {
+    from {
       opacity: 0;
-      visibility: hidden;
-      transition: opacity 0.2s ease, visibility 0.2s;
-    }
-
-    .reader-backdrop-open {
-      display: block;
-      opacity: 1;
-      visibility: visible;
-    }
-
-    .read-stage {
-      padding: clamp(0.45rem, 2vw, 0.65rem) clamp(0.45rem, 2.5vw, 0.75rem)
-        clamp(0.55rem, 2.5vw, 0.75rem);
-    }
-
-    .epub-nav {
-      margin-left: auto;
+      transform: translateY(-4px);
     }
   }
 
-  @media (max-width: 480px) {
-    .back span:last-child {
-      display: none;
+  /* ——— Узкие экраны: панель поверх текста ——— */
+  @media (max-width: 1100px) {
+    .side {
+      position: absolute;
+      z-index: 40;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: min(var(--side-w), 88vw);
+      transform: translateX(-102%);
+      transition:
+        transform 0.26s ease,
+        box-shadow 0.26s ease;
+      background: var(--panel-elevated);
     }
 
-    .back {
-      width: 2.75rem;
-      min-height: 2.75rem;
-      justify-content: center;
-      padding: 0;
+    .panel-open .side {
+      width: min(var(--side-w), 88vw);
+      transform: none;
+      box-shadow: var(--shadow-float);
     }
 
-    .settings-link {
-      display: none;
+    .side-tabs,
+    .side-body {
+      min-width: 0;
     }
 
-    .read-top {
-      gap: 0.45rem;
-      padding:
-        max(0.5rem, env(safe-area-inset-top))
-        max(0.55rem, env(safe-area-inset-right))
-        0.5rem
-        max(0.55rem, env(safe-area-inset-left));
+    .side-tabs .side-close {
+      display: block;
     }
 
-    .title-block {
-      order: 3;
-      flex-basis: 100%;
-      padding: 0.15rem 0 0.1rem;
+    .side-backdrop {
+      display: block;
+      position: absolute;
+      inset: 0;
+      z-index: 39;
+      border: none;
+      background: rgba(20, 16, 30, 0.28);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.26s ease;
     }
 
-    .reader-panel-toggle {
-      margin-left: auto;
-      width: 2.75rem;
-      min-height: 2.75rem;
-      padding: 0;
-      border-radius: 999px;
-    }
-
-    .reader-panel-toggle span {
-      display: none;
-    }
-
-    .typst-export-top {
-      padding-inline: 0.7rem;
-      min-height: 2.75rem;
-    }
-
-    .mini {
-      width: 2.75rem;
-      height: 2.75rem;
-    }
-
-    .read-stage {
-      padding: 0;
-    }
-
-    .stage-frame {
-      border-right: 0;
-      border-bottom: 0;
-      border-left: 0;
-      border-radius: 0;
-      box-shadow: none;
-    }
-
-    .tab {
-      padding: 0.55rem 0.25rem;
-      font-size: 0.72rem;
+    .panel-open .side-backdrop {
+      opacity: 1;
+      pointer-events: auto;
     }
   }
 
   @media (max-width: 600px) {
-    .read-body {
-      overscroll-behavior: none;
-    }
-
-    .tab,
-    .list-btn,
-    .page-cell {
-      min-height: 2.75rem;
-    }
-  }
-
-  @media (max-height: 520px) and (orientation: landscape) {
     .read-top {
-      min-height: 0;
-      flex-wrap: nowrap;
-      padding-top: max(0.35rem, env(safe-area-inset-top));
-      padding-bottom: 0.35rem;
-    }
-
-    .title-block {
-      order: 0;
-      flex-basis: 8rem;
-      padding: 0;
-    }
-
-    .read-title {
-      -webkit-line-clamp: 1;
-      line-clamp: 1;
+      padding-left: max(0.35rem, env(safe-area-inset-left));
+      padding-right: max(0.35rem, env(safe-area-inset-right));
     }
 
     .read-author {
+      display: none;
+    }
+
+    .immersive-btn {
       display: none;
     }
   }

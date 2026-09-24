@@ -180,10 +180,75 @@ export interface PdfReadyInfo {
   numPages: number;
 }
 
+/** Позиция чтения, которую сообщает любой просмотрщик. */
+export interface ReadingPosition {
+  /** 0…1, если известно */
+  progress: number | null;
+  chapterLabel: string;
+  /** Символов до конца главы / книги (EPUB, FB2) */
+  charsLeftChapter: number | null;
+  charsLeftBook: number | null;
+  /** PDF: страниц до конца главы / книги */
+  pagesLeftChapter?: number | null;
+  pagesLeftBook?: number | null;
+  /** Подпись позиции: «стр. 12 / 300» */
+  pageLabel?: string;
+}
+
+export interface SearchHit {
+  id: string;
+  label: string;
+  before: string;
+  match: string;
+  after: string;
+  /** Адрес внутри книги: CFI, `p:<страница>:<смещение>` или `s:<секция>:<смещение>` */
+  loc: string;
+}
+
+/** Выделение текста, о котором просмотрщик сообщает странице чтения. */
+export interface ReaderSelection {
+  text: string;
+  /** Прямоугольник выделения в координатах окна */
+  rect: { left: number; top: number; width: number; height: number };
+  /** Привязка для постоянного выделения */
+  anchor: Pick<Highlight, "page" | "cfi" | "block" | "offset" | "chapterLabel">;
+  clear: () => void;
+}
+
+/** Абзац для чтения вслух, RSVP и режима фокуса. */
+export interface ReadingUnit {
+  text: string;
+  /** Подсветить абзац как текущий */
+  mark?: () => void;
+  unmark?: () => void;
+  /** Показать абзац на экране (перелистнуть при необходимости) */
+  reveal?: () => Promise<void>;
+}
+
+/** Кусок текста книги до текущей позиции (для пересказа и глоссария без спойлеров). */
+export interface TextChunk {
+  id: string;
+  label: string;
+  text: string;
+  /** Глава прочитана не до конца */
+  partial: boolean;
+}
+
 export interface EpubReaderApi {
   toc: { label: string; href: string; level: number }[];
   spine: { label: string; href: string }[];
   goTo: (href: string) => Promise<void>;
   prev: () => Promise<void>;
   next: () => Promise<void>;
+  /** Перейти к доле книги 0…1 */
+  seek?: (fraction: number) => Promise<void>;
+  search?: (query: string, signal?: AbortSignal) => Promise<SearchHit[]>;
+  goToHit?: (hit: SearchHit) => Promise<void>;
+  /** Абзацы от текущего места до конца главы */
+  unitsFromHere?: () => Promise<ReadingUnit[]>;
+  /** Следующая глава после `unitsFromHere` (для непрерывного чтения вслух) */
+  advanceChapter?: () => Promise<boolean>;
+  chunksBefore?: () => Promise<TextChunk[]>;
 }
+
+export type ReaderApi = EpubReaderApi;
