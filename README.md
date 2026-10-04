@@ -96,6 +96,14 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo check --locked --manifest-path src-tauri/Cargo.toml
 ```
 
+Install on Linux for the current user (adds Reader to the application menu, no root needed; re-run to update):
+
+```bash
+./scripts/install-linux.sh
+```
+
+Remove it with `./scripts/install-linux.sh --uninstall`.
+
 Build a desktop package:
 
 ```bash
