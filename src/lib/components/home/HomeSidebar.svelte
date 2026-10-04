@@ -137,9 +137,7 @@
 
 <style>
   .side {
-    position: sticky;
-    top: 0;
-    height: 100dvh;
+    height: 100%;
     width: 15.5rem;
     flex-shrink: 0;
     display: flex;

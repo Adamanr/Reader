@@ -153,9 +153,10 @@
         rgba(0, 0, 0, 0.3)
       ),
       hsl(var(--spine-h) var(--spine-s) var(--spine-l));
+    /* Тени без размытия — размытые на каждом корешке тормозят прокрутку. */
     box-shadow:
       inset 0 -2px 0 rgba(0, 0, 0, 0.18),
-      2px 0 3px rgba(0, 0, 0, 0.12);
+      1px 0 0 rgba(0, 0, 0, 0.14);
     transform-origin: bottom center;
     transition: transform 0.25s cubic-bezier(0.33, 1, 0.68, 1);
     overflow: hidden;

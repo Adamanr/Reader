@@ -488,7 +488,7 @@
   const editMeta = $derived(editPath && snapshot ? (snapshot.metadata.books[editPath] ?? null) : null);
 </script>
 
-<svelte:window onkeydown={onKey} onscroll={() => (scrolled = window.scrollY > 8)} />
+<svelte:window onkeydown={onKey} />
 
 <div class="app" style:--glow={glow}>
   <HomeSidebar
@@ -503,8 +503,6 @@
   />
 
   <main class="main">
-    <div class="ambient" aria-hidden="true"></div>
-
     <header class="topbar" class:scrolled>
       <button type="button" class="icon menu-btn" aria-label="Меню" onclick={() => (menuOpen = true)}>
         <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" /></svg>
@@ -531,6 +529,11 @@
         </button>
       {/if}
     </header>
+
+    <!-- Прокручивается только эта область: шапка и боковая панель стоят на месте
+         без position: sticky, который WebKitGTK перерисовывает на каждом кадре. -->
+    <div class="content" onscroll={(e) => (scrolled = e.currentTarget.scrollTop > 8)}>
+    <div class="ambient" aria-hidden="true"></div>
 
     {#if banner}
       <div class="banner" role="alert">{banner}</div>
@@ -672,6 +675,7 @@
         {/if}
       </section>
     {/if}
+    </div>
   </main>
 </div>
 
@@ -778,16 +782,26 @@
 <style>
   .app {
     display: flex;
-    min-height: 100dvh;
+    height: 100dvh;
+    overflow: hidden;
     background: var(--bg-soft);
     color: var(--text-soft);
   }
 
   .main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .content {
     position: relative;
     isolation: isolate;
     flex: 1;
-    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 0 clamp(1rem, 4vw, 3.2rem) 4rem;
   }
 
@@ -805,14 +819,13 @@
 
   /* ——— Верхняя панель ——— */
   .topbar {
-    position: sticky;
-    top: 0;
+    position: relative;
     z-index: 20;
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: max(1rem, env(safe-area-inset-top)) clamp(1rem, 4vw, 3.2rem) 1rem;
-    margin: 0 calc(-1 * clamp(1rem, 4vw, 3.2rem)) 0.6rem;
+    padding: max(1rem, env(safe-area-inset-top)) clamp(1rem, 4vw, 3.2rem) 0.9rem;
     border-bottom: 1px solid transparent;
     transition:
       background 0.25s ease,
@@ -1569,13 +1582,12 @@
   }
 
   @media (max-width: 600px) {
-    .main {
+    .content {
       padding: 0 1rem 3rem;
     }
 
     .topbar {
       padding-inline: 1rem;
-      margin-inline: -1rem;
     }
 
     .add span {

@@ -54,10 +54,10 @@
     position: absolute;
     left: 8%;
     right: 2%;
-    bottom: -7%;
+    bottom: -6%;
     height: 12%;
     border-radius: 50%;
-    background: radial-gradient(closest-side, rgba(20, 14, 30, 0.24), rgba(20, 14, 30, 0.08) 60%, transparent);
+    background: radial-gradient(closest-side, rgba(20, 14, 30, 0.42), rgba(20, 14, 30, 0.12) 60%, transparent);
     z-index: 0;
     transition:
       transform 0.35s ease,
@@ -71,9 +71,8 @@
     border-radius: 3px 7px 7px 3px;
     overflow: hidden;
     background: #d9d2c6;
-    box-shadow:
-      0 1px 2px rgba(20, 14, 30, 0.2),
-      0 10px 24px -8px rgba(20, 14, 30, 0.35);
+    /* Без box-shadow в покое: в WebKitGTK тень на каждой обложке стоит
+       ~6 мс на кадр прокрутки. Объём даёт градиентная тень под книгой. */
     transform-origin: left center;
     transition:
       transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1),
@@ -134,7 +133,11 @@
     border-radius: 0 4px 4px 0;
     background: repeating-linear-gradient(90deg, #fbf8f1 0 1px, #e7e0d2 1px 2px);
     box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.12);
-    transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+    /* Спрятан под обложкой: не рисуем, пока книгу не приоткрыли. */
+    opacity: 0;
+    transition:
+      transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1),
+      opacity 0.2s ease;
   }
 
   :global(:hover > .book-hover-target) .book.tilt .cover,
@@ -148,6 +151,7 @@
   :global(:hover > .book-hover-target) .book.tilt .pages,
   .book.tilt:hover .pages {
     transform: translateX(6%);
+    opacity: 1;
   }
 
   :global(:hover > .book-hover-target) .book.tilt.dusty .cover,
