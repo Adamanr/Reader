@@ -1375,7 +1375,9 @@
 <style>
   .read-shell {
     --side-w: 21rem;
-    --top-h: 3.4rem;
+    /* Целые пиксели: область чтения не должна начинаться на дробной позиции,
+       иначе WebKit рисует её слой со сдвигом на долю пикселя — текст мылится. */
+    --top-h: 54px;
     display: flex;
     flex-direction: column;
     height: 100vh;

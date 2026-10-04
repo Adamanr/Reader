@@ -20,6 +20,7 @@
   import { translateStringList } from "$lib/translate/translateApi";
   import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
   import { enqueueRender } from "$lib/pdf/renderQueue";
+  import { snapScroll } from "$lib/ui/snapScroll";
   import { reading, updateReading } from "$lib/reading/settings.svelte";
   import type { PagePalette } from "$lib/reading/palette";
   import { excerptAround, findAll, offsetOfPoint } from "$lib/reading/textAnchor";
@@ -246,10 +247,33 @@
     const ro = new ResizeObserver(() => {
       viewW = el.clientWidth;
       viewH = el.clientHeight;
+      const cs = getComputedStyle(el);
+      padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    const unsnap = snapScroll(el);
+    return () => {
+      ro.disconnect();
+      unsnap();
+    };
   });
+
+  let padX = $state(24);
+
+  /** Ширина строки страниц в целых пикселях (как в PdfPage). */
+  function rowWidth(row: number[]): number {
+    let w = 0;
+    for (const n of row) {
+      const b = baseOf(n);
+      w += Math.round(Math.round(b.w * scale) * crop.w);
+    }
+    return w + GAP * (row.length - 1);
+  }
+
+  /** Отступ слева без полупикселей: центрирование flex даёт .5px и размывает страницу. */
+  function rowOffset(row: number[]): number {
+    return Math.max(0, Math.floor((viewW - padX - rowWidth(row)) / 2));
+  }
 
   /** Рендерим только страницы рядом с экраном — большие PDF не съедают память. */
   $effect(() => {
@@ -733,7 +757,7 @@
     >
       {#each shownRows as row (row[0])}
         {@const rowIdx = Math.floor((row[0]! - 1) / perRow)}
-        <div class="pdf-row" data-row={rowIdx} style:gap="{GAP}px">
+        <div class="pdf-row" data-row={rowIdx} style:gap="{GAP}px" style:margin-left="{rowOffset(row)}px">
           {#each row as n (n)}
             <PdfPage
               doc={pdfDoc!}
@@ -787,10 +811,11 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
-    padding: 1.2rem 0.75rem 40vh;
+    /* Только целые пиксели: дробные отступы сдвигают страницы на полпикселя. */
+    padding: 20px 12px 40vh;
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: flex-start;
     gap: 18px;
     overscroll-behavior: contain;
   }
@@ -802,7 +827,6 @@
 
   .pdf-row {
     display: flex;
-    justify-content: center;
     min-width: min-content;
   }
 
@@ -908,7 +932,7 @@
 
   @media (max-width: 600px) {
     .pdf-scroller {
-      padding: 0.5rem 0.25rem 30vh;
+      padding: 8px 4px 30vh;
       gap: 10px;
     }
     .pdf-zoom {

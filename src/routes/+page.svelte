@@ -43,6 +43,7 @@
   import { exportBookToTypst } from "$lib/typst/exportToTypst";
   import { toast, toastError } from "$lib/ui/toast.svelte";
   import type { CoverTone } from "$lib/reading/palette";
+  import { snapScroll } from "$lib/ui/snapScroll";
 
   let snapshot = $state<LibrarySnapshot | null>(getCachedLibrarySnapshot());
   let shelfFilter = $state<string>("all");
@@ -56,6 +57,12 @@
   let searchEl = $state<HTMLInputElement | null>(null);
   let tone = $state<CoverTone | null>(null);
   let scrolled = $state(false);
+  let contentEl = $state<HTMLDivElement | null>(null);
+
+  $effect(() => {
+    const el = contentEl;
+    if (el) return snapScroll(el);
+  });
 
   let ctxMenu = $state<{ x: number; y: number; path: string } | null>(null);
   let bookAction = $state<{ kind: "hide" | "delete"; path: string } | null>(null);
@@ -532,7 +539,7 @@
 
     <!-- Прокручивается только эта область: шапка и боковая панель стоят на месте
          без position: sticky, который WebKitGTK перерисовывает на каждом кадре. -->
-    <div class="content" onscroll={(e) => (scrolled = e.currentTarget.scrollTop > 8)}>
+    <div class="content" bind:this={contentEl} onscroll={(e) => (scrolled = e.currentTarget.scrollTop > 8)}>
     <div class="ambient" aria-hidden="true"></div>
 
     {#if banner}
@@ -802,7 +809,7 @@
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: 0 clamp(1rem, 4vw, 3.2rem) 4rem;
+    padding: 0 round(clamp(16px, 4vw, 52px), 1px) 64px;
   }
 
   .ambient {
@@ -825,7 +832,10 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: max(1rem, env(safe-area-inset-top)) clamp(1rem, 4vw, 3.2rem) 0.9rem;
+    /* Фиксированная целая высота: область книг ниже не должна начинаться на дробном пикселе. */
+    box-sizing: border-box;
+    height: calc(76px + env(safe-area-inset-top));
+    padding: env(safe-area-inset-top) round(clamp(16px, 4vw, 52px), 1px) 0;
     border-bottom: 1px solid transparent;
     transition:
       background 0.25s ease,

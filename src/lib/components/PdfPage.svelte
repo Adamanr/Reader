@@ -60,10 +60,14 @@
   let token = 0;
   let textReady = $state(false);
 
-  const fullW = $derived(base.w * scale);
-  const fullH = $derived(base.h * scale);
-  const boxW = $derived(fullW * crop.w);
-  const boxH = $derived(fullH * crop.h);
+  // Целые CSS-пиксели: дробный размер холста заставляет WebKit
+  // пересэмплировать страницу, и текст выглядит мыльным.
+  const fullW = $derived(Math.round(base.w * scale));
+  const fullH = $derived(Math.round(base.h * scale));
+  const boxW = $derived(Math.round(fullW * crop.w));
+  const boxH = $derived(Math.round(fullH * crop.h));
+  const cropX = $derived(Math.round(crop.x * fullW));
+  const cropY = $derived(Math.round(crop.y * fullH));
 
   async function resolveDest(dest: unknown): Promise<number | null> {
     if (dest == null) return null;
@@ -171,15 +175,16 @@
     const ok = await enqueueRender(doc, async () => {
       if (my !== token) return false;
       const dpr = pixelRatio(viewport);
-      back.width = Math.floor(viewport.width * dpr);
-      back.height = Math.floor(viewport.height * dpr);
+      // Холст ровно под CSS-размер страницы × плотность пикселей: 1 пиксель холста = 1 пиксель экрана.
+      back.width = Math.round(fullW * dpr);
+      back.height = Math.round(fullH * dpr);
       const ctx = ctxOf(back);
       if (!ctx) return false;
       renderTask = page.render({
         canvas: back,
         canvasContext: ctx,
         viewport,
-        transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+        transform: [back.width / viewport.width, 0, 0, back.height / viewport.height, 0, 0],
         background: "#ffffff",
         intent: "any",
         optionalContentConfigPromise: doc.getOptionalContentConfig({ intent: "any" }),
@@ -316,7 +321,7 @@
     class="pdf-page-inner"
     style:width="{fullW}px"
     style:height="{fullH}px"
-    style:transform="translate({-crop.x * fullW}px, {-crop.y * fullH}px)"
+    style:transform="translate({-cropX}px, {-cropY}px)"
     style:--scale-factor={scale}
   >
     <canvas

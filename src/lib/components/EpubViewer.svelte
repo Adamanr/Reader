@@ -18,6 +18,7 @@
   import { reading } from "$lib/reading/settings.svelte";
   import { highlightFill } from "$lib/reading/highlights";
   import { storeRead, storeWrite, pathKey } from "$lib/storage/store";
+  import { snapScroll } from "$lib/ui/snapScroll";
 
   interface Props {
     relativePath: string;
@@ -68,6 +69,7 @@
   let ready = $state(false);
 
   let rendition: any = null;
+  let unsnap: (() => void) | null = null;
   let book: any = null;
   let session = 0;
 
@@ -624,6 +626,13 @@
       };
       onReaderApi?.(api);
       ready = true;
+      // В режиме ленты прокручивается контейнер epub.js — доводим его до целого пикселя.
+      unsnap?.();
+      unsnap = null;
+      if (mode === "scrolled") {
+        const box = el.querySelector<HTMLElement>(".epub-container");
+        if (box) unsnap = snapScroll(box);
+      }
       redrawHighlights(true);
       void prepareLocations(path, sid);
     } catch (e) {
@@ -652,6 +661,8 @@
     void mountBook(path, el, sid, openAt, mode);
     return () => {
       session += 1;
+      unsnap?.();
+      unsnap = null;
       onReaderApi?.(null);
       rendition?.destroy();
       book?.destroy();
@@ -818,13 +829,32 @@
     }
   }
 
-  const stageStyle = $derived(
-    `max-width:calc(${reading.s.measure * 0.52}em + ${reading.s.margin * 2}px);` +
-      `font-size:${reading.s.fontSize}px;padding:0 ${reading.s.margin}px;`,
-  );
+  let rootEl = $state<HTMLDivElement | null>(null);
+  let rootW = $state(0);
+
+  $effect(() => {
+    const el = rootEl;
+    if (!el) return;
+    const ro = new ResizeObserver(() => (rootW = el.clientWidth));
+    ro.observe(el);
+    rootW = el.clientWidth;
+    return () => ro.disconnect();
+  });
+
+  /**
+   * Ширина и отступ колонки в целых пикселях: iframe книги — отдельный слой,
+   * и при дробном сдвиге (центрирование margin: auto) WebKit рисует текст мыльным.
+   */
+  const stageStyle = $derived.by(() => {
+    const s = reading.s;
+    const want = Math.round(s.measure * 0.52 * s.fontSize + s.margin * 2);
+    const width = rootW ? Math.min(rootW, want) : want;
+    const left = rootW ? Math.max(0, Math.floor((rootW - width) / 2)) : 0;
+    return `width:${width}px;margin-left:${left}px;font-size:${s.fontSize}px;padding:0 ${Math.round(s.margin)}px;`;
+  });
 </script>
 
-<div class="epub-root" style:--page-bg={palette.bg}>
+<div class="epub-root" style:--page-bg={palette.bg} bind:this={rootEl}>
   <div class="stage-wrap">
     <div class="stage" class:scrolled={flow === "scrolled"} style={stageStyle} bind:this={host}></div>
     {#if loading}
@@ -872,12 +902,10 @@
   }
   .stage {
     flex: 1;
-    width: 100%;
     min-height: 0;
     overflow: hidden;
-    margin: 0 auto;
-    padding-top: 1.4rem !important;
-    padding-bottom: 1.4rem !important;
+    padding-top: 22px !important;
+    padding-bottom: 22px !important;
     box-sizing: border-box;
   }
   .stage.scrolled {
@@ -896,7 +924,7 @@
     .stage {
       padding-left: max(14px, env(safe-area-inset-left)) !important;
       padding-right: max(14px, env(safe-area-inset-right)) !important;
-      padding-top: 0.8rem !important;
+      padding-top: 12px !important;
     }
   }
 </style>

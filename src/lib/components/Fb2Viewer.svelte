@@ -14,6 +14,7 @@
   import { translateStringList } from "$lib/translate/translateApi";
   import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
   import { ensureAppFonts } from "$lib/reading/fonts";
+  import { snapScroll } from "$lib/ui/snapScroll";
   import { typographyVars, varsToStyle } from "$lib/reading/contentCss";
   import type { PagePalette } from "$lib/reading/palette";
   import { reading } from "$lib/reading/settings.svelte";
@@ -306,6 +307,11 @@
       emitPosition();
     });
   }
+
+  $effect(() => {
+    const el = scrollRoot;
+    if (el) return snapScroll(el);
+  });
 
   /** После отрисовки: индекс абзацев, восстановление позиции, выделения. */
   $effect(() => {
