@@ -1,1431 +1,209 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use tauri::AppHandle;
-use walkdir::WalkDir;
+mod backups;
+mod dialogs;
+mod formats;
+mod library;
+mod library_index;
+mod llm;
+mod model;
+mod opds;
+mod search;
+mod storage;
+mod sync_merge;
+mod telegram;
+mod telegram_vault;
+mod translate;
+mod tts;
+mod typst;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Shelf {
-    pub id: String,
-    pub name: String,
-    pub order: i32,
-}
+use tauri::Manager;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct BookComment {
-    pub id: String,
-    pub body: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chapter_label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub excerpt: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SavedQuote {
-    pub id: String,
-    pub text: String,
-    pub created_at: String,
-    pub accent: String,
-    pub layout: String,
-    #[serde(default)]
-    pub include_page: bool,
-    #[serde(default)]
-    pub include_chapter: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub book_title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub book_author: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bg_image_data_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bg_image_opacity: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub overlay_color: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub overlay_opacity: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bg_scale: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bg_fit: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct BookMeta {
-    pub path: String,
-    #[serde(default)]
-    pub hidden: bool,
-    pub shelf_id: String,
-    #[serde(default)]
-    pub shelf_ids: Vec<String>,
-    pub importance: String,
-    pub review: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub author: Option<String>,
-    #[serde(default)]
-    pub comments: Vec<BookComment>,
-    #[serde(default)]
-    pub quotes: Vec<SavedQuote>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_read_pdf_page: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_read_pdf_total: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_read_location: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_read_location_label: Option<String>,
-    #[serde(default)]
-    pub translation_exported: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cover_thumb_data_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_opened_at: Option<String>,
-    /// Путь к файлу стиля `.typ` относительно корня библиотеки; None — общий стиль из настроек.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub typst_style_relative_path: Option<String>,
-    /// Поля, которые знает только фронтенд (статус, выделения, прогресс…): сохраняем как есть.
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct LibraryMetadata {
-    pub shelves: Vec<Shelf>,
-    pub books: HashMap<String, BookMeta>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct AppConfig {
-    pub library_root: Option<String>,
-    /// Путь к `.typ` теме по умолчанию (относительно папки библиотеки), например `.reader-typst-themes/minimal.typ`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_typst_style_relative_path: Option<String>,
-    /// Хранить метаданные, заметки и обложки в `<библиотека>/.reader/` —
-    /// тогда их синхронизирует Syncthing/Nextcloud вместе с книгами.
-    #[serde(default)]
-    pub sync_in_library: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LibrarySnapshot {
-    pub library_root: Option<String>,
-    pub book_paths: Vec<String>,
-    pub hidden_book_paths: Vec<String>,
-    pub metadata: LibraryMetadata,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_typst_style_relative_path: Option<String>,
-    pub sync_in_library: bool,
-}
-
-/// Служебная папка внутри библиотеки (не сканируется как книги).
-const LIBRARY_DATA_DIR: &str = ".reader";
-
-fn app_dir(_app: &AppHandle) -> PathBuf {
-    let dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("com.adaman.reader");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-/// Каталог данных: папка приложения или `<библиотека>/.reader` при синхронизации.
-fn data_dir(app: &AppHandle) -> PathBuf {
-    if let Ok(c) = load_config(app) {
-        if c.sync_in_library {
-            if let Some(root) = c.library_root.as_deref() {
-                let root = Path::new(root);
-                if root.is_dir() {
-                    let d = root.join(LIBRARY_DATA_DIR);
-                    let _ = std::fs::create_dir_all(&d);
-                    return d;
-                }
-            }
-        }
-    }
-    app_dir(app)
-}
-
-fn pdf_translations_dir(app: &AppHandle) -> PathBuf {
-    let d = data_dir(app).join("pdf-translations");
-    let _ = std::fs::create_dir_all(&d);
-    d
-}
-
-fn pdf_translation_file(app: &AppHandle, book_relative_path: &str) -> PathBuf {
-    let mut h = Sha256::new();
-    h.update(book_relative_path.as_bytes());
-    let hash = format!("{:x}", h.finalize());
-    pdf_translations_dir(app).join(format!("{}.json", hash))
-}
-
-fn config_path(app: &AppHandle) -> PathBuf {
-    app_dir(app).join("config.json")
-}
-
-fn metadata_path(app: &AppHandle) -> PathBuf {
-    data_dir(app).join("library-metadata.json")
-}
-
-fn covers_dir(app: &AppHandle) -> PathBuf {
-    let d = data_dir(app).join("covers");
-    let _ = std::fs::create_dir_all(&d);
-    d
-}
-
-fn store_dir(app: &AppHandle) -> PathBuf {
-    let d = data_dir(app).join("store");
-    let _ = std::fs::create_dir_all(&d);
-    d
-}
-
-fn path_hash(s: &str) -> String {
-    format!("{:x}", Sha256::digest(s.as_bytes()))
-}
-
-fn cover_file(app: &AppHandle, book_relative_path: &str) -> PathBuf {
-    covers_dir(app).join(format!("{}.txt", path_hash(book_relative_path)))
-}
-
-/// Имя записи хранилища: только `[a-z0-9._-]`, без обхода каталогов.
-fn store_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
-    let ok = !name.is_empty()
-        && name.len() <= 120
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
-    if !ok {
-        return Err("Недопустимое имя записи".into());
-    }
-    Ok(store_dir(app).join(format!("{name}.json")))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
-    let p = config_path(app);
-    if !p.exists() {
-        return Ok(AppConfig::default());
-    }
-    let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    serde_json::from_str(&s).map_err(|e| e.to_string())
-}
-
-fn save_config(app: &AppHandle, c: &AppConfig) -> Result<(), String> {
-    let p = config_path(app);
-    let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    atomic_write(&p, s.as_bytes())
-}
-
-fn default_metadata() -> LibraryMetadata {
-    LibraryMetadata {
-        shelves: vec![Shelf {
-            id: "default".into(),
-            name: "Общая полка".into(),
-            order: 0,
-        }],
-        books: HashMap::new(),
-        extra: Default::default(),
+/// Вспомогательные режимы того же исполняемого файла (без окна). `Some(код)` — выйти с ним.
+pub fn run_helper_if_requested() -> Option<i32> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match args.as_slice() {
+        [flag, book, out] if flag == search::EXTRACT_FLAG => Some(search::helper_extract(
+            std::path::Path::new(book),
+            std::path::Path::new(out),
+        )),
+        _ => None,
     }
 }
 
-fn load_metadata(app: &AppHandle) -> Result<LibraryMetadata, String> {
-    let p = metadata_path(app);
-    if !p.exists() {
-        return Ok(default_metadata());
-    }
-    let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    let mut m: LibraryMetadata = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-    if m.shelves.is_empty() {
-        m.shelves = default_metadata().shelves;
-    }
-    // Раньше миниатюры обложек лежали прямо в JSON и раздували его до мегабайт.
-    // Переносим их в отдельные файлы один раз.
-    let mut migrated = false;
-    for (path, book) in m.books.iter_mut() {
-        if let Some(url) = book.cover_thumb_data_url.take() {
-            let _ = atomic_write(&cover_file(app, path), url.as_bytes());
-            migrated = true;
-        }
-    }
-    if migrated {
-        save_metadata(app, &m)?;
-    }
-    Ok(m)
+/// Команды с типизированными обёртками в `src/lib/bindings.ts` (tauri-specta).
+/// Остальные пока вызываются через `invoke` с типами, написанными вручную: метаданные
+/// библиотеки содержат поля, известные только фронтенду, а чтение книги отдаёт байты.
+const TYPED_COMMANDS: &[&str] = &[
+    "choose_library_root",
+    "pick_and_import_books",
+    "save_file_dialog",
+    "metadata_backups_list",
+    "metadata_backup_create",
+    "metadata_backup_restore",
+    "search_reindex",
+    "search_status",
+    "search_query",
+    "opds_fetch",
+    "opds_import",
+    "telegram_status",
+    "telegram_send_code",
+    "telegram_sign_in",
+    "telegram_logout",
+    "telegram_resolve_channel",
+    "source_list_files",
+    "source_import_files",
+    "source_count_new",
+];
+
+/// Путь к сгенерированным привязкам относительно `src-tauri`.
+const BINDINGS: &str = "../src/lib/bindings.ts";
+
+fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
+    tauri_specta::Builder::<tauri::Wry>::new()
+        .commands(tauri_specta::collect_commands![
+            dialogs::choose_library_root,
+            dialogs::pick_and_import_books,
+            dialogs::save_file_dialog,
+            backups::metadata_backups_list,
+            backups::metadata_backup_create,
+            backups::metadata_backup_restore,
+            search::search_reindex,
+            search::search_status,
+            search::search_query,
+            opds::opds_fetch,
+            opds::opds_import,
+            telegram::telegram_status,
+            telegram::telegram_send_code,
+            telegram::telegram_sign_in,
+            telegram::telegram_logout,
+            telegram::telegram_resolve_channel,
+            telegram::source_list_files,
+            telegram::source_import_files,
+            telegram::source_count_new,
+        ])
+        // Полезная нагрузка событий прогресса.
+        .typ::<telegram::ImportProgress>()
+        .typ::<opds::OpdsProgress>()
+        .typ::<search::IndexProgress>()
+        // Ошибки — строки, как у остальных команд: обёртки бросают их, а не возвращают Result.
+        .error_handling(tauri_specta::ErrorHandlingMode::Throw)
+        // Размеры файлов и миллисекунды далеко от 2^53.
+        .dangerously_cast_bigints_to_number()
+        // Типы ходят в одну сторону (из Rust в интерфейс) — отдельные варианты
+        // для сериализации и десериализации только запутывают.
+        .disable_serde_phases()
 }
 
-fn save_metadata(app: &AppHandle, m: &LibraryMetadata) -> Result<(), String> {
-    let p = metadata_path(app);
-    let s = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
-    atomic_write(&p, s.as_bytes())
-}
-
-/// Безопасный путь под корнем библиотеки. Цель может ещё не существовать (экспорт Typst и т.д.),
-/// поэтому нельзя вызывать `canonicalize()` для `joined` — иначе OS error 2.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let rel = rel.trim().trim_start_matches(['/', '\\']);
-    let mut out = root.clone();
-    for seg in rel
-        .split(|c| c == '/' || c == '\\')
-        .filter(|s| !s.is_empty())
-    {
-        match seg {
-            "." => {}
-            ".." => {
-                out.pop();
-                if !out.starts_with(&root) {
-                    return Err("Недопустимый путь".into());
-                }
-            }
-            s => {
-                if s.contains('\0') {
-                    return Err("Недопустимый путь".into());
-                }
-                out.push(s);
-            }
-        }
-    }
-    if !out.starts_with(&root) {
-        return Err("Недопустимый путь".into());
-    }
-    Ok(out)
-}
-
-static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Запись через временный файл и rename — не остаётся обрубка размером 0 при обрыве записи.
-/// Команды выполняются параллельно, поэтому записи сериализуем и даём временным файлам уникальные имена.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Некорректный путь".to_string())?;
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| "Некорректное имя файла".to_string())?;
-    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = parent.join(format!(".{name}.part.{}.{seq}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })?;
-    Ok(())
-}
-
-fn scan_library(root: &Path) -> Result<Vec<String>, String> {
-    if !root.exists() {
-        return Err("Папка библиотеки не найдена".into());
-    }
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    let walker = WalkDir::new(&root)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || e.file_name() != LIBRARY_DATA_DIR);
-    for entry in walker.filter_map(|e| e.ok()) {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let Some(ext) = p.extension().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        match ext.to_lowercase().as_str() {
-            "pdf" | "epub" | "fb2" | "typ" => {
-                let rel = p.strip_prefix(&root).map_err(|e| e.to_string())?;
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-            }
-            _ => {}
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-fn merge_scan_into_metadata(paths: &[String], meta: &mut LibraryMetadata) -> bool {
-    let mut changed = false;
-    for p in paths {
-        if !meta.books.contains_key(p) {
-            meta.books.insert(
-                p.clone(),
-                BookMeta {
-                    path: p.clone(),
-                    hidden: false,
-                    shelf_id: "default".into(),
-                    shelf_ids: vec![],
-                    importance: "normal".into(),
-                    review: String::new(),
-                    title: None,
-                    author: None,
-                    comments: vec![],
-                    quotes: vec![],
-                    last_read_pdf_page: None,
-                    last_read_pdf_total: None,
-                    last_read_location: None,
-                    last_read_location_label: None,
-                    translation_exported: false,
-                    cover_thumb_data_url: None,
-                    last_opened_at: None,
-                    typst_style_relative_path: None,
-                    extra: {
-                        let mut extra = serde_json::Map::new();
-                        extra.insert("addedAtMs".into(), serde_json::json!(now_ms()));
-                        extra
-                    },
-                },
-            );
-            changed = true;
-        }
-    }
-    let set: HashSet<_> = paths.iter().cloned().collect();
-    let previous_len = meta.books.len();
-    meta.books.retain(|k, _| set.contains(k));
-    changed || meta.books.len() != previous_len
-}
-
-#[tauri::command]
-async fn get_library_snapshot(app: AppHandle) -> Result<LibrarySnapshot, String> {
-    let config = load_config(&app)?;
-    let root_str = config.library_root.clone();
-    let scan_result = root_str.as_ref().map(|r| scan_library(Path::new(r)));
-    let paths = match scan_result {
-        None => vec![],
-        Some(Ok(p)) => p,
-        Some(Err(_e)) => {
-            let metadata = load_metadata(&app)?;
-            let default_typst_style_relative_path = load_config(&app)
-                .ok()
-                .and_then(|c| c.default_typst_style_relative_path);
-            return Ok(LibrarySnapshot {
-                library_root: root_str,
-                book_paths: vec![],
-                hidden_book_paths: vec![],
-                metadata,
-                default_typst_style_relative_path,
-                sync_in_library: config.sync_in_library,
-            });
-        }
-    };
-    let mut metadata = load_metadata(&app)?;
-    if merge_scan_into_metadata(&paths, &mut metadata) {
-        save_metadata(&app, &metadata)?;
-    }
-    let (hidden_book_paths, book_paths): (Vec<_>, Vec<_>) = paths
-        .into_iter()
-        .partition(|path| metadata.books.get(path).is_some_and(|book| book.hidden));
-    let default_typst_style_relative_path = load_config(&app)
-        .ok()
-        .and_then(|c| c.default_typst_style_relative_path);
-    Ok(LibrarySnapshot {
-        library_root: root_str,
-        book_paths,
-        hidden_book_paths,
-        metadata,
-        default_typst_style_relative_path,
-        sync_in_library: config.sync_in_library,
-    })
-}
-
-#[tauri::command]
-async fn set_library_root(app: AppHandle, path: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    if !p.is_dir() {
-        return Err("Укажите существующую папку".into());
-    }
-    let canon = p.canonicalize().map_err(|e| e.to_string())?;
-    let mut c = load_config(&app)?;
-    c.library_root = Some(canon.to_string_lossy().to_string());
-    save_config(&app, &c)
-}
-
-#[tauri::command]
-async fn save_library_metadata(app: AppHandle, metadata: LibraryMetadata) -> Result<(), String> {
-    save_metadata(&app, &metadata)
-}
-
-#[tauri::command]
-async fn delete_library_book(app: AppHandle, relative_path: String) -> Result<(), String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .as_deref()
-        .ok_or_else(|| "Папка библиотеки не выбрана.".to_string())?;
-    let root = Path::new(root)
-        .canonicalize()
-        .map_err(|_| "Папка библиотеки недоступна.".to_string())?;
-    let joined = safe_join(&root, &relative_path)?;
-    let target = joined
-        .canonicalize()
-        .map_err(|_| "Файл книги уже отсутствует.".to_string())?;
-
-    if !target.starts_with(&root) || !target.is_file() {
-        return Err("Книга находится вне папки библиотеки.".into());
-    }
-    let supported = target
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "pdf" | "epub" | "fb2" | "typ"
-            )
-        });
-    if !supported {
-        return Err("Этот файл нельзя удалить из Reader.".into());
-    }
-
-    std::fs::remove_file(&target)
-        .map_err(|_| "Не удалось удалить файл. Проверьте права доступа.".to_string())?;
-
-    // Файл уже удалён: очистка связанных данных выполняется best effort и не
-    // превращает успешное удаление в ошибку из-за вторичного шага.
-    if let Ok(mut metadata) = load_metadata(&app) {
-        metadata.books.remove(&relative_path);
-        let _ = save_metadata(&app, &metadata);
-    }
-    let translation = pdf_translation_file(&app, &relative_path);
-    if translation.exists() {
-        let _ = std::fs::remove_file(translation);
-    }
-    let _ = std::fs::remove_file(cover_file(&app, &relative_path));
-    Ok(())
-}
-
-#[tauri::command]
-async fn cover_get(app: AppHandle, book_relative_path: String) -> Result<Option<String>, String> {
-    let p = cover_file(&app, &book_relative_path);
-    if !p.exists() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(&p)
-        .map(Some)
+fn export_bindings(path: &std::path::Path) -> Result<(), String> {
+    specta_builder()
+        .export(
+            specta_typescript::Typescript::default().header(
+                "// Сгенерировано tauri-specta из Rust (src-tauri). Не редактируйте вручную.\n",
+            ),
+            path,
+        )
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn cover_set(
-    app: AppHandle,
-    book_relative_path: String,
-    data_url: String,
-) -> Result<(), String> {
-    if !data_url.starts_with("data:image/") || data_url.len() > 400_000 {
-        return Err("Некорректная обложка".into());
-    }
-    atomic_write(&cover_file(&app, &book_relative_path), data_url.as_bytes())
-}
-
-#[tauri::command]
-async fn store_read(app: AppHandle, name: String) -> Result<Option<String>, String> {
-    let p = store_file(&app, &name)?;
-    if !p.exists() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(&p)
-        .map(Some)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn store_write(app: AppHandle, name: String, json: String) -> Result<(), String> {
-    let p = store_file(&app, &name)?;
-    atomic_write(&p, json.as_bytes())
-}
-
-/// Копирует файлы с диска (перетаскивание в окно) в корень библиотеки.
-/// Возвращает относительные пути добавленных книг.
-#[tauri::command]
-async fn import_books(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    let mut added = Vec::new();
-    for src in paths {
-        let src = PathBuf::from(src);
-        if !src.is_file() {
-            continue;
-        }
-        let Some(ext) = src
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase)
-        else {
-            continue;
-        };
-        if !matches!(ext.as_str(), "pdf" | "epub" | "fb2") {
-            continue;
-        }
-        let stem = src
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("book")
-            .to_string();
-        if let Ok(canon) = src.canonicalize() {
-            if canon.starts_with(&root) {
-                // Уже внутри библиотеки — просто покажем её.
-                if let Ok(rel) = canon.strip_prefix(&root) {
-                    added.push(rel.to_string_lossy().replace('\\', "/"));
-                }
-                continue;
-            }
-        }
-        let mut dest = root.join(format!("{stem}.{ext}"));
-        let mut n = 2;
-        while dest.exists() {
-            dest = root.join(format!("{stem} ({n}).{ext}"));
-            n += 1;
-        }
-        std::fs::copy(&src, &dest).map_err(|e| format!("Копирование: {e}"))?;
-        if let Ok(rel) = dest.strip_prefix(&root) {
-            added.push(rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
-    Ok(added)
-}
-
-/// Включает/выключает хранение данных в папке библиотеки.
-/// При включении копирует текущие данные туда, если там ещё ничего нет;
-/// если данные уже есть (пришли с другого устройства) — использует их.
-#[tauri::command]
-async fn set_sync_in_library(app: AppHandle, enabled: bool) -> Result<(), String> {
-    let mut c = load_config(&app)?;
-    if c.sync_in_library == enabled {
-        return Ok(());
-    }
-    let root = c
-        .library_root
-        .clone()
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let lib_dir = Path::new(&root).join(LIBRARY_DATA_DIR);
-    let local_dir = app_dir(&app);
-    let (from, to) = if enabled {
-        (local_dir, lib_dir)
-    } else {
-        (lib_dir, local_dir)
-    };
-    std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
-    if !to.join("library-metadata.json").exists() {
-        copy_data_tree(&from, &to)?;
-    }
-    c.sync_in_library = enabled;
-    save_config(&app, &c)
-}
-
-fn copy_data_tree(from: &Path, to: &Path) -> Result<(), String> {
-    for name in ["library-metadata.json"] {
-        let src = from.join(name);
-        if src.is_file() {
-            std::fs::copy(&src, to.join(name)).map_err(|e| e.to_string())?;
-        }
-    }
-    for dir in ["covers", "store", "pdf-translations"] {
-        let src = from.join(dir);
-        if !src.is_dir() {
-            continue;
-        }
-        let dst = to.join(dir);
-        std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
-        for entry in std::fs::read_dir(&src)
-            .map_err(|e| e.to_string())?
-            .flatten()
-        {
-            let p = entry.path();
-            if p.is_file() {
-                let target = dst.join(entry.file_name());
-                if !target.exists() {
-                    std::fs::copy(&p, target).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct LibreTranslateOk {
-    #[serde(rename = "translatedText")]
-    translated_text: String,
-}
-
-#[tauri::command]
-async fn translate_texts(
-    texts: Vec<String>,
-    source: String,
-    target: String,
-    api_base: String,
-    api_key: Option<String>,
-) -> Result<Vec<String>, String> {
-    let base = api_base.trim().trim_end_matches('/').to_string();
-    if base.is_empty() {
-        return Err("Укажите URL сервера перевода (LibreTranslate) в настройках.".into());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let url = format!("{}/translate", base);
-    let mut out: Vec<String> = Vec::with_capacity(texts.len());
-
-    for t in texts {
-        let mut body = serde_json::json!({
-            "q": t,
-            "source": source,
-            "target": target,
-            "format": "text",
-        });
-        if let Some(ref k) = api_key {
-            let ks = k.trim();
-            if !ks.is_empty() {
-                body["api_key"] = serde_json::json!(ks);
-            }
-        }
-
-        let resp = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Запрос перевода: {}", e))?;
-
-        let status = resp.status();
-        let raw = resp.text().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            let short: String = raw.chars().take(280).collect();
-            return Err(format!("Перевод: HTTP {} — {}", status, short));
-        }
-
-        let parsed: LibreTranslateOk = serde_json::from_str(&raw).map_err(|e| {
-            format!(
-                "Разбор ответа ({}): {}",
-                e,
-                raw.chars().take(160).collect::<String>()
-            )
-        })?;
-        out.push(parsed.translated_text);
-    }
-
-    Ok(out)
-}
-
-/// Файл книги как двоичный ответ (ArrayBuffer в JS) — без base64 и JSON,
-/// что заметно быстрее и не нагружает интерфейс на больших PDF.
-#[tauri::command]
-async fn read_book_bytes(
-    app: AppHandle,
-    relative_path: String,
-) -> Result<tauri::ipc::Response, String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let full = safe_join(&PathBuf::from(root), &relative_path)?;
-    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(&full))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    if bytes.is_empty() {
-        return Err(
-            "Файл книги пуст (0 байт). Проверьте файл в папке библиотеки или переимпортируйте книгу."
-                .into(),
-        );
-    }
-    Ok(tauri::ipc::Response::new(bytes))
-}
-
-#[tauri::command]
-async fn read_book_base64(app: AppHandle, relative_path: String) -> Result<String, String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root);
-    let full = safe_join(&root, &relative_path)?;
-    let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
-    if bytes.is_empty() {
-        return Err(
-            "Файл книги пуст (0 байт). Проверьте файл в папке библиотеки или переимпортируйте книгу."
-                .into(),
-        );
-    }
-    Ok(STANDARD.encode(&bytes))
-}
-
-/// Сохраняет PDF перевода в той же папке, что и исходник: `translate_<имя>.pdf`, помечает оригинал.
-#[tauri::command]
-async fn save_translated_pdf_next_to_source(
-    app: AppHandle,
-    source_relative_path: String,
-    pdf_base64: String,
-) -> Result<String, String> {
-    let bytes = STANDARD
-        .decode(pdf_base64.trim())
-        .map_err(|e| e.to_string())?;
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root);
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let source_full = safe_join(&root, &source_relative_path)?;
-    let parent = source_full
-        .parent()
-        .ok_or("Некорректный путь к книге")?
-        .to_path_buf();
-    let stem = source_full
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("book");
-    let new_name = format!("translate_{}.pdf", stem);
-    let dest_full = parent.join(&new_name);
-    atomic_write(&dest_full, &bytes)?;
-    let new_rel = dest_full
-        .strip_prefix(&root)
-        .map_err(|_| String::from("Новый файл вне папки библиотеки"))?
-        .to_string_lossy()
-        .replace('\\', "/");
-    let mut meta = load_metadata(&app)?;
-    if let Some(b) = meta.books.get_mut(&source_relative_path) {
-        b.translation_exported = true;
-    }
-    save_metadata(&app, &meta)?;
-    Ok(new_rel)
-}
-
-/// Запись произвольного файла (путь из диалога сохранения).
-#[tauri::command]
-async fn write_file_base64(path: String, contents_base64: String) -> Result<(), String> {
-    let bytes = STANDARD
-        .decode(contents_base64.trim())
-        .map_err(|e| e.to_string())?;
-    let p = PathBuf::from(path);
-    atomic_write(&p, &bytes)
-}
-
-#[tauri::command]
-async fn pdf_translation_load(
-    app: AppHandle,
-    book_relative_path: String,
-) -> Result<Option<String>, String> {
-    let p = pdf_translation_file(&app, &book_relative_path);
-    if !p.exists() {
-        return Ok(None);
-    }
-    let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    Ok(Some(s))
-}
-
-#[tauri::command]
-async fn pdf_translation_save(
-    app: AppHandle,
-    book_relative_path: String,
-    json: String,
-) -> Result<(), String> {
-    let p = pdf_translation_file(&app, &book_relative_path);
-    if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&p, json).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn pdf_translation_delete(app: AppHandle, book_relative_path: String) -> Result<(), String> {
-    let p = pdf_translation_file(&app, &book_relative_path);
-    if p.exists() {
-        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn read_library_utf8(app: AppHandle, relative_path: String) -> Result<String, String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root);
-    let full = safe_join(&root, &relative_path)?;
-    std::fs::read_to_string(&full).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn write_library_utf8(
-    app: AppHandle,
-    relative_path: String,
-    content: String,
-) -> Result<(), String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root);
-    let full = safe_join(&root, &relative_path)?;
-    atomic_write(&full, content.as_bytes())
-}
-
-#[tauri::command]
-async fn write_library_base64(
-    app: AppHandle,
-    relative_path: String,
-    contents_base64: String,
-) -> Result<(), String> {
-    let bytes = STANDARD
-        .decode(contents_base64.trim())
-        .map_err(|e| e.to_string())?;
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root);
-    let full = safe_join(&root, &relative_path)?;
-    atomic_write(&full, &bytes)
-}
-
-#[tauri::command]
-async fn set_default_typst_style(
-    app: AppHandle,
-    relative_path: Option<String>,
-) -> Result<(), String> {
-    let mut c = load_config(&app)?;
-    c.default_typst_style_relative_path = relative_path;
-    save_config(&app, &c)
-}
-
-#[tauri::command]
-async fn list_typst_theme_files(app: AppHandle) -> Result<Vec<String>, String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let root = PathBuf::from(root);
-    let themes_dir = root.join(".reader-typst-themes");
-    if !themes_dir.is_dir() {
-        return Ok(vec![]);
-    }
-    let mut names: Vec<String> = std::fs::read_dir(&themes_dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-        .filter_map(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .filter(|x| x.eq_ignore_ascii_case("typ"))
-                .and_then(|_| e.file_name().into_string().ok())
-        })
-        .collect();
-    names.sort();
-    Ok(names)
-}
-
-/// Собирает пути `reader-typst-{hash}-N.svg` в temp, отсортированные по N.
-fn typst_svg_page_files(
-    temp_dir: &Path,
-    hash_hex: &str,
-) -> Result<Vec<std::path::PathBuf>, String> {
-    let prefix = format!("reader-typst-{}-", hash_hex);
-    let mut pages: Vec<(u32, std::path::PathBuf)> = Vec::new();
-    let read = std::fs::read_dir(temp_dir).map_err(|e| e.to_string())?;
-    for entry in read.filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) || !name.ends_with(".svg") {
-            continue;
-        }
-        let rest = name
-            .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(".svg"));
-        if let Some(num_str) = rest {
-            if let Ok(n) = num_str.parse::<u32>() {
-                pages.push((n, entry.path()));
-            }
-        }
-    }
-    pages.sort_by_key(|(n, _)| *n);
-    Ok(pages.into_iter().map(|(_, p)| p).collect())
-}
-
-/// Удаляет старые SVG превью для того же ключа (перед перекомпиляцией).
-fn remove_old_typst_preview_svgs(temp_dir: &Path, hash_hex: &str) {
-    let prefix = format!("reader-typst-{}-", hash_hex);
-    if let Ok(read) = std::fs::read_dir(temp_dir) {
-        for entry in read.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && name.ends_with(".svg") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-}
-
-/// Компиляция `main_relative` в SVG через CLI `typst`.
-/// Несколько страниц: в Typst 0.14+ нужен шаблон пути с `{p}`, иначе ошибка экспорта.
-/// `pages`: например `"1-18"` для быстрого предпросмотра (`typst compile --pages …`).
-#[tauri::command]
-async fn compile_typst_to_svg(
-    app: AppHandle,
-    main_relative: String,
-    pages: Option<String>,
-) -> Result<String, String> {
-    let config = load_config(&app)?;
-    let root = config
-        .library_root
-        .ok_or("Сначала выберите папку библиотеки")?;
-    let lib_root = PathBuf::from(root);
-    let main_full = safe_join(&lib_root, &main_relative)?;
-    let work_dir = main_full
-        .parent()
-        .ok_or("Некорректный путь к файлу")?
-        .to_path_buf();
-    let file_name = main_full
-        .file_name()
-        .ok_or("Некорректное имя файла")?
-        .to_str()
-        .ok_or("Некорректное имя файла")?;
-
-    let hash_hex = format!("{:x}", Sha256::digest(main_relative.as_bytes()));
-    let temp_dir = std::env::temp_dir();
-    remove_old_typst_preview_svgs(&temp_dir, &hash_hex);
-
-    let pattern_path = temp_dir.join(format!("reader-typst-{}-{{p}}.svg", hash_hex));
-    let pattern_for_typst = pattern_path.to_string_lossy().replace('\\', "/");
-
-    let mut cmd = std::process::Command::new("typst");
-    cmd.current_dir(&work_dir)
-        .arg("compile")
-        .arg("--format")
-        .arg("svg");
-    if let Some(ref p) = pages {
-        let pt = p.trim();
-        if !pt.is_empty() {
-            cmd.arg("--pages").arg(pt);
-        }
-    }
-    cmd.arg(file_name).arg(&pattern_for_typst);
-
-    let output = cmd.output().map_err(|e| {
-        format!(
-            "Не удалось запустить `typst` (установите Typst и добавьте в PATH): {}",
-            e
-        )
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("код {:?}", output.status.code())
-        };
-        return Err(format!("Typst: {}", detail));
-    }
-
-    let pages = typst_svg_page_files(&temp_dir, &hash_hex)?;
-    if pages.is_empty() {
-        return Err(
-            "Typst не создал SVG (пустой вывод). Проверьте путь к файлу и версию typst.".into(),
-        );
-    }
-
-    let mut combined = String::from(r#"<div class="reader-typst-svg-pages">"#);
-    for path in pages {
-        let svg = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        combined.push_str(r#"<div class="reader-typst-svg-page">"#);
-        combined.push_str(&svg);
-        combined.push_str("</div>");
-    }
-    combined.push_str("</div>");
-    Ok(combined)
-}
-
-#[tauri::command]
-async fn typst_cli_version() -> Result<Option<String>, String> {
-    let out = match std::process::Command::new("typst")
-        .arg("--version")
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return Ok(None),
-    };
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(if s.is_empty() { None } else { Some(s) })
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LlmMessage {
-    pub role: String,
-    pub content: String,
-}
-
-/// Как TranslateBooksWithLLMs OpenAI: для локального OpenAI-совместимого API отключаем thinking.
-fn llm_local_disable_thinking(base: &str) -> bool {
-    let b = base.to_lowercase();
-    let local = b.contains("127.0.0.1") || b.contains("localhost");
-    let official = b.contains("api.openai.com");
-    local && !official
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChatResponse {
-    choices: Vec<OpenAiChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChatChoice {
-    message: OpenAiChatMsgBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChatMsgBody {
-    content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModelList {
-    data: Vec<OpenAiModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModelEntry {
-    id: String,
-}
-
-/// OpenAI-совместимый чат (LM Studio, Ollama `/v1`).
-#[tauri::command]
-async fn llm_chat_completion(
-    base_url: String,
-    model: String,
-    messages: Vec<LlmMessage>,
-    temperature: f64,
-    max_tokens: Option<u32>,
-) -> Result<String, String> {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("Укажите URL API (например http://127.0.0.1:1234/v1)".into());
-    }
-    let url = format!("{}/chat/completions", base);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(900))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": serde_json::to_value(&messages).map_err(|e| e.to_string())?,
-        "temperature": temperature,
-        "stream": false,
-    });
-    if let Some(mt) = max_tokens {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("max_tokens".into(), serde_json::json!(mt));
-        }
-    }
-    if llm_local_disable_thinking(&base) {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("thinking".into(), serde_json::json!(false));
-            obj.insert("enable_thinking".into(), serde_json::json!(false));
-            obj.insert(
-                "chat_template_kwargs".into(),
-                serde_json::json!({ "enable_thinking": false }),
-            );
-        }
-    }
-
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("LLM: {}", e))?;
-
-    let status = resp.status();
-    let raw = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let short: String = raw.chars().take(400).collect();
-        return Err(format!("LLM: HTTP {} — {}", status, short));
-    }
-
-    let parsed: OpenAiChatResponse = serde_json::from_str(&raw).map_err(|e| {
-        format!(
-            "LLM JSON ({}): {}",
-            e,
-            raw.chars().take(200).collect::<String>()
-        )
-    })?;
-
-    let content = parsed
-        .choices
-        .first()
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-
-    Ok(content)
-}
-
-/// GET `{base_url}/models`.
-#[tauri::command]
-async fn llm_list_models(base_url: String) -> Result<Vec<String>, String> {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("Укажите URL API".into());
-    }
-    let url = format!("{}/models", base);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Модели: {}", e))?;
-
-    let status = resp.status();
-    let raw = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let short: String = raw.chars().take(400).collect();
-        return Err(format!("Модели: HTTP {} — {}", status, short));
-    }
-
-    let parsed: OpenAiModelList = serde_json::from_str(&raw).map_err(|e| {
-        format!(
-            "Список моделей ({}): {}",
-            e,
-            raw.chars().take(200).collect::<String>()
-        )
-    })?;
-
-    let mut ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiEmbeddingResponse {
-    data: Vec<OpenAiEmbedding>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiEmbedding {
-    embedding: Vec<f32>,
-    #[serde(default)]
-    index: usize,
-}
-
-/// OpenAI-совместимые эмбеддинги (`/embeddings`) — для «созвездия цитат».
-#[tauri::command]
-async fn llm_embeddings(
-    base_url: String,
-    model: String,
-    inputs: Vec<String>,
-) -> Result<Vec<Vec<f32>>, String> {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("Укажите URL API".into());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(format!("{base}/embeddings"))
-        .json(&serde_json::json!({ "model": model, "input": inputs }))
-        .send()
-        .await
-        .map_err(|e| format!("Эмбеддинги: {e}"))?;
-    let status = resp.status();
-    let raw = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let short: String = raw.chars().take(400).collect();
-        return Err(format!("Эмбеддинги: HTTP {status} — {short}"));
-    }
-    let mut parsed: OpenAiEmbeddingResponse =
-        serde_json::from_str(&raw).map_err(|e| format!("Эмбеддинги JSON: {e}"))?;
-    parsed.data.sort_by_key(|d| d.index);
-    Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
-}
-
-fn command_exists(name: &str) -> bool {
-    std::process::Command::new(name)
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-/// Доступные локальные движки озвучки.
-#[tauri::command]
-async fn tts_engines() -> Vec<String> {
-    let mut out = Vec::new();
-    if command_exists("piper") {
-        out.push("piper".to_string());
-    }
-    if command_exists("espeak-ng") {
-        out.push("espeak-ng".to_string());
-    }
-    out
-}
-
-/// Озвучка фрагмента локальным движком: WAV в base64.
-/// `voice` — путь к модели `.onnx` для Piper или имя голоса espeak-ng.
-#[tauri::command]
-async fn tts_synthesize(
-    engine: String,
-    text: String,
-    voice: Option<String>,
-    rate: f32,
-) -> Result<String, String> {
-    use std::io::Write;
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err("Пустой текст".into());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let tmp = std::env::temp_dir().join(format!(
-            "reader-tts-{}-{}.wav",
-            std::process::id(),
-            now_ms()
-        ));
-        let rate = rate.clamp(0.5, 3.0);
-        let mut cmd = match engine.as_str() {
-            "piper" => {
-                let model = voice
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or("Укажите модель Piper (.onnx) в настройках")?;
-                let mut c = std::process::Command::new("piper");
-                c.arg("--model")
-                    .arg(model.trim())
-                    .arg("--output_file")
-                    .arg(&tmp)
-                    .arg("--length_scale")
-                    .arg(format!("{:.2}", 1.0 / rate));
-                c
-            }
-            "espeak-ng" => {
-                let mut c = std::process::Command::new("espeak-ng");
-                c.arg("-v")
-                    .arg(
-                        voice
-                            .filter(|v| !v.trim().is_empty())
-                            .unwrap_or_else(|| "ru".into()),
-                    )
-                    .arg("-s")
-                    .arg(format!("{}", (175.0 * rate) as u32))
-                    .arg("--stdin")
-                    .arg("-w")
-                    .arg(&tmp);
-                c
-            }
-            _ => return Err("Неизвестный движок озвучки".to_string()),
-        };
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Не удалось запустить {engine}: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("{engine}: {}", err.trim()));
-        }
-        let bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_file(&tmp);
-        Ok(STANDARD.encode(bytes))
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // В отладке привязки пересобираются при каждом запуске; в CI их свежесть проверяет тест.
+    #[cfg(debug_assertions)]
+    if let Err(e) =
+        export_bindings(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BINDINGS))
+    {
+        eprintln!("bindings.ts: {e}");
+    }
+    let typed = specta_builder().invoke_handler();
+    let untyped: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
+        Box::new(tauri::generate_handler![
+            library::get_library_snapshot,
+            library::save_library_metadata,
+            library::delete_library_book,
+            library::read_book_base64,
+            library::read_book_bytes,
+            library::save_translated_pdf_next_to_source,
+            translate::translate_texts,
+            library::pdf_translation_load,
+            library::pdf_translation_save,
+            library::pdf_translation_delete,
+            library::read_library_utf8,
+            library::write_library_utf8,
+            library::write_library_base64,
+            typst::set_default_typst_style,
+            typst::list_typst_theme_files,
+            typst::compile_typst_to_svg,
+            typst::typst_cli_version,
+            llm::llm_chat_completion,
+            llm::llm_list_models,
+            storage::cover_get,
+            storage::cover_set,
+            storage::store_read,
+            storage::store_write,
+            storage::set_sync_in_library,
+            llm::llm_embeddings,
+            tts::tts_engines,
+            tts::tts_synthesize,
+        ]);
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
-            get_library_snapshot,
-            set_library_root,
-            save_library_metadata,
-            delete_library_book,
-            read_book_base64,
-            read_book_bytes,
-            save_translated_pdf_next_to_source,
-            write_file_base64,
-            translate_texts,
-            pdf_translation_load,
-            pdf_translation_save,
-            pdf_translation_delete,
-            read_library_utf8,
-            write_library_utf8,
-            write_library_base64,
-            set_default_typst_style,
-            list_typst_theme_files,
-            compile_typst_to_svg,
-            typst_cli_version,
-            llm_chat_completion,
-            llm_list_models,
-            cover_get,
-            cover_set,
-            store_read,
-            store_write,
-            import_books,
-            set_sync_in_library,
-            llm_embeddings,
-            tts_engines,
-            tts_synthesize,
-        ])
+        .manage(telegram::TelegramState::default())
+        .manage(opds::OpdsState::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                library::import_dropped(window.app_handle(), paths.clone());
+            }
+        })
+        .invoke_handler(move |invoke| {
+            if TYPED_COMMANDS.contains(&invoke.message.command()) {
+                typed(invoke)
+            } else {
+                untyped(invoke)
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Привязки в репозитории должны совпадать с тем, что генерирует Rust.
+    /// Обновить: `UPDATE_BINDINGS=1 cargo test bindings_are_up_to_date`.
+    #[test]
+    fn bindings_are_up_to_date() {
+        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BINDINGS);
+        if std::env::var_os("UPDATE_BINDINGS").is_some() {
+            export_bindings(&committed).unwrap();
+        }
+        let fresh = std::env::temp_dir().join(format!("reader-bindings-{}.ts", std::process::id()));
+        export_bindings(&fresh).unwrap();
+        let generated = std::fs::read_to_string(&fresh).unwrap();
+        let _ = std::fs::remove_file(&fresh);
+        let current = std::fs::read_to_string(&committed).unwrap_or_default();
+        assert!(
+            generated == current,
+            "src/lib/bindings.ts устарел: UPDATE_BINDINGS=1 cargo test bindings_are_up_to_date"
+        );
+        // Каждая команда из списка маршрутизации действительно описана в привязках.
+        for name in TYPED_COMMANDS {
+            let camel: String = name
+                .split('_')
+                .enumerate()
+                .map(|(i, w)| {
+                    if i == 0 {
+                        w.to_string()
+                    } else {
+                        w[..1].to_uppercase() + &w[1..]
+                    }
+                })
+                .collect();
+            assert!(
+                generated.contains(&format!("{camel}: (")),
+                "нет {camel} в bindings.ts"
+            );
+        }
+    }
 }

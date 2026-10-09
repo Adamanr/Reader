@@ -2,6 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Тот же файл служит вспомогательным процессом для разбора книг (см. `search`).
+    if let Some(code) = reader_lib::run_helper_if_requested() {
+        std::process::exit(code);
+    }
     // DMA-BUF рендерер WebKitGTK намеренно не отключаем: без него на NVIDIA
     // кадры копируются через процессор и прокрутка заметно тормозит.
     // Пропадание текста PDF лечится иначе — страницы рисуются на CPU-холсте.
