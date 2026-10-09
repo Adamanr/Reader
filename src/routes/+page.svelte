@@ -2,7 +2,8 @@
   import { onDestroy, onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { commands } from "$lib/bindings";
+  import { listen } from "@tauri-apps/api/event";
   import type { BookMeta, LibraryMetadata, LibrarySnapshot, ReadingStatus, Shelf } from "$lib/types";
   import { READING_STATUS_OPTIONS } from "$lib/types";
   import { getBookFormat } from "$lib/bookFormat";
@@ -214,10 +215,10 @@
   }
 
   async function pickFolder() {
-    const dir = await open({ directory: true, multiple: false });
-    if (typeof dir !== "string") return;
     try {
-      await invoke("set_library_root", { path: dir });
+      // Папку выбирает нативный диалог в Rust: путь из интерфейса бэкенд не принимает.
+      const dir = await commands.chooseLibraryRoot();
+      if (!dir) return;
       await refresh();
     } catch (e) {
       banner = String(e);
@@ -298,48 +299,48 @@
   }
 
   // ——— Импорт: кнопка и перетаскивание файлов в окно ———
-  async function importPaths(paths: string[]) {
-    if (!paths.length) return;
+  // Пути к файлам интерфейс не передаёт: диалог открывает Rust, а брошенные в окно файлы
+  // Rust получает от ОС сам и сообщает результат событием `books-imported`.
+  async function reportImport(added: string[]) {
+    await refresh();
+    if (added.length) toast(`Добавлено: ${added.length} ${pluralBooks(added.length)}`, "success");
+    else toast("Подходящих файлов нет — поддерживаются PDF, EPUB, FB2 и FB2.ZIP", "info");
+  }
+
+  async function pickBooks() {
     if (!snapshot?.libraryRoot) {
       toast("Сначала выберите папку библиотеки", "error");
       return;
     }
     try {
-      const added = await invoke<string[]>("import_books", { paths });
-      await refresh();
-      if (added.length) toast(`Добавлено: ${added.length} ${pluralBooks(added.length)}`, "success");
-      else toast("Подходящих файлов нет — поддерживаются PDF, EPUB и FB2", "info");
+      const added = await commands.pickAndImportBooks();
+      if (added) await reportImport(added);
     } catch (e) {
       toastError(e, "Импорт");
     }
   }
 
-  async function pickBooks() {
-    const picked = await open({ multiple: true, filters: [{ name: "Книги", extensions: ["pdf", "epub", "fb2"] }] });
-    if (!picked) return;
-    await importPaths(Array.isArray(picked) ? picked : [picked]);
-  }
-
   onMount(() => {
     if (!isTauriRuntime()) return;
-    let unlisten: (() => void) | null = null;
+    const unlisteners: (() => void)[] = [];
     let alive = true;
+    const keep = (un: () => void) => (alive ? unlisteners.push(un) : un());
     void import("@tauri-apps/api/webview").then(async ({ getCurrentWebview }) => {
-      const un = await getCurrentWebview().onDragDropEvent((event) => {
-        const t = event.payload.type;
-        if (t === "enter" || t === "over") dragActive = true;
-        else if (t === "leave") dragActive = false;
-        else if (t === "drop") {
-          dragActive = false;
-          void importPaths(event.payload.paths);
-        }
-      });
-      if (alive) unlisten = un;
-      else un();
+      keep(
+        await getCurrentWebview().onDragDropEvent((event) => {
+          const t = event.payload.type;
+          if (t === "enter" || t === "over") dragActive = true;
+          else dragActive = false;
+        }),
+      );
     });
+    void listen<{ added: string[]; error?: string }>("books-imported", (e) => {
+      if (e.payload.error) toastError(e.payload.error, "Импорт");
+      else void reportImport(e.payload.added);
+    }).then(keep);
     return () => {
       alive = false;
-      unlisten?.();
+      for (const un of unlisteners) un();
     };
   });
 

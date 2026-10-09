@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { commands } from "$lib/bindings";
 import { buildTranslatedPdf, loadBundledCyrillicFont } from "./buildTranslatedPdf";
 import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
 import { loadPdfBookTranslationFile } from "$lib/translate/pdfFullBookJob";
@@ -78,15 +78,6 @@ export async function exportTranslatedPdfToChosenFile(bookRelativePath: string):
   const name = titleFromPath(bookRelativePath).replace(/\.pdf$/i, "");
   const suggested = `translate_${name || "book"}.pdf`;
 
-  const path = await save({
-    defaultPath: suggested,
-    filters: [{ name: "PDF", extensions: ["pdf"] }],
-  });
-
-  if (path == null || path === "") return;
-
-  await invoke("write_file_base64", {
-    path,
-    contentsBase64: bytesToBase64(bytes),
-  });
+  // Путь выбирается в нативном диалоге на стороне Rust — интерфейс его не передаёт.
+  await commands.saveFileDialog(suggested, "PDF", ["pdf"], bytesToBase64(bytes));
 }

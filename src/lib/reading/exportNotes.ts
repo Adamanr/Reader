@@ -1,5 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { commands } from "$lib/bindings";
 import type { BookMeta, Highlight } from "$lib/types";
 import { isTauriRuntime } from "$lib/isTauri";
 import { writeTextToClipboard } from "$lib/clipboardWrite";
@@ -97,11 +96,12 @@ export async function saveMarkdown(defaultName: string, md: string): Promise<"sa
     await writeTextToClipboard(md);
     return "copied";
   }
-  const path = await save({
-    defaultPath: defaultName.replace(/[\\/:*?"<>|]+/g, " ").trim() + ".md",
-    filters: [{ name: "Markdown", extensions: ["md"] }],
-  });
-  if (!path) return "cancelled";
-  await invoke("write_file_base64", { path, contentsBase64: utf8ToBase64(md) });
-  return "saved";
+  // Путь выбирается в нативном диалоге на стороне Rust — интерфейс его не передаёт.
+  const saved = await commands.saveFileDialog(
+    defaultName.replace(/[\\/:*?"<>|]+/g, " ").trim() + ".md",
+    "Markdown",
+    ["md"],
+    utf8ToBase64(md),
+  );
+  return saved ? "saved" : "cancelled";
 }
