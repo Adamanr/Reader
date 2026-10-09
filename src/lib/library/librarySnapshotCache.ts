@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { relocateStatsBook } from "$lib/reading/stats.svelte";
+import { toast } from "$lib/ui/toast.svelte";
 import type { LibraryMetadata, LibrarySnapshot } from "$lib/types";
 import { relocateVocabBook } from "$lib/vocab/vocab.svelte";
 
@@ -30,6 +31,9 @@ export async function fetchFreshLibrarySnapshot(): Promise<LibrarySnapshot> {
   for (const { from, to } of snap.relocated ?? []) {
     relocateStatsBook(from, to);
     relocateVocabBook(from, to);
+  }
+  if (snap.mergedConflicts) {
+    toast("Изменения с другого устройства объединены с этими", "info");
   }
   return setCachedLibrarySnapshot(snap);
 }

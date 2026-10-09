@@ -225,7 +225,8 @@
   }
 
   async function persist(next: LibraryMetadata) {
-    await invoke("save_library_metadata", { metadata: next });
+    const revision = await invoke<number>("save_library_metadata", { metadata: next });
+    next = { ...next, revision };
     setCachedLibraryMetadata(next);
     if (snapshot) snapshot = { ...snapshot, metadata: next };
   }

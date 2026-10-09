@@ -315,7 +315,15 @@
     const next: LibraryMetadata = { ...snapshot.metadata, books };
     setCachedLibraryMetadata(next);
     snapshot = { ...snapshot, metadata: next };
-    void invoke("save_library_metadata", { metadata: next }).catch((e) => toastError(e, "Сохранение"));
+    void invoke<number>("save_library_metadata", { metadata: next })
+      .then((revision) => {
+        // Номер версии обновляем, только если с тех пор не было новых правок.
+        if (snapshot?.metadata !== next) return;
+        const saved = { ...next, revision };
+        setCachedLibraryMetadata(saved);
+        snapshot = { ...snapshot, metadata: saved };
+      })
+      .catch((e) => toastError(e, "Сохранение"));
   }
 
   let lastOpenedPatchKey = $state("");

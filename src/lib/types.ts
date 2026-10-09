@@ -141,6 +141,11 @@ export interface BookMeta {
 export interface LibraryMetadata {
   shelves: Shelf[];
   books: Record<string, BookMeta>;
+  /**
+   * Номер версии на диске. Отправляется обратно при сохранении: по нему бэкенд понимает,
+   * что копия устарела, и сливает изменения, а не перезаписывает файл.
+   */
+  revision?: number;
 }
 
 export interface LibrarySnapshot {
@@ -154,6 +159,8 @@ export interface LibrarySnapshot {
   syncInLibrary?: boolean;
   /** Книги, которые при этом сканировании были найдены под новым путём. */
   relocated?: { from: string; to: string }[];
+  /** Объединено конфликтных копий синхронизации (изменения с других устройств). */
+  mergedConflicts?: number;
 }
 
 export const IMPORTANCE_OPTIONS: { value: Importance; label: string }[] = [
