@@ -27,7 +27,7 @@
 
   const pal = $derived(PALETTES[Math.floor(hashNum(seed) * PALETTES.length)]!);
   const motif = $derived(Math.floor(hashNum(seed + "m") * 4));
-  const cleanTitle = $derived(title.replace(/\.(pdf|epub|fb2|typ)$/i, "").replace(/[_]+/g, " "));
+  const cleanTitle = $derived(title.replace(/\.(pdf|epub|fb2\.zip|fb2|typ)$/i, "").replace(/[_]+/g, " "));
 </script>
 
 <div class="art" class:compact style:--bg={pal[0]} style:--ink={pal[1]}>

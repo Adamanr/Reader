@@ -17,6 +17,8 @@ export function getPathExtension(path: string): string {
 }
 
 export function getBookFormat(path: string): BookFormat | null {
+  // `.fb2.zip` бэкенд распаковывает при чтении — для интерфейса это обычный FB2.
+  if (/\.fb2\.zip$/i.test(normalizeBookPath(path))) return "fb2";
   const ext = getPathExtension(path);
   if (ext === "pdf") return "pdf";
   if (ext === "epub") return "epub";
