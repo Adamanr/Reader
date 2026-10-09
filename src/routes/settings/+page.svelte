@@ -1,7 +1,9 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import BackupsCard from "$lib/components/BackupsCard.svelte";
+  import BookSourcesCard from "$lib/components/BookSourcesCard.svelte";
   import SettingsThemeCard from "$lib/components/SettingsThemeCard.svelte";
+  import TelegramAuthCard from "$lib/components/TelegramAuthCard.svelte";
   import TranslateSettingsCard from "$lib/components/TranslateSettingsCard.svelte";
   import TypstSettingsCard from "$lib/components/TypstSettingsCard.svelte";
   import ReaderToolsSettingsCard from "$lib/components/ReaderToolsSettingsCard.svelte";
@@ -18,7 +20,7 @@
       <div class="settings-heading">
         <span class="settings-kicker">Reader</span>
         <h1 class="settings-title">Настройки</h1>
-        <p>Оформление, синхронизация, помощник, озвучка, перевод, экспорт и резервные копии.</p>
+        <p>Оформление, синхронизация, помощник, озвучка, источники Telegram, перевод, экспорт и резервные копии.</p>
       </div>
     </div>
   </header>
@@ -26,6 +28,8 @@
   <main class="settings-main">
     <SettingsThemeCard sectionTitle="Оформление" />
     <ReaderToolsSettingsCard />
+    <TelegramAuthCard />
+    <BookSourcesCard />
     <TypstSettingsCard />
     <TranslateSettingsCard />
     <BackupsCard />
