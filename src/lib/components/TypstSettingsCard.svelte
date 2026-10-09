@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { isTauriRuntime } from "$lib/isTauri";
+  import { fetchLibrarySnapshot } from "$lib/library/librarySnapshotCache";
   import { ensureBuiltinTypstThemes } from "$lib/typst/exportToTypst";
   import DreamSelect from "$lib/components/DreamSelect.svelte";
 
@@ -23,9 +24,7 @@
     try {
       await ensureBuiltinTypstThemes();
       themes = await invoke<string[]>("list_typst_theme_files");
-      const snap = await invoke<{
-        defaultTypstStyleRelativePath?: string | null;
-      }>("get_library_snapshot");
+      const snap = await fetchLibrarySnapshot();
       defaultStylePath = snap.defaultTypstStyleRelativePath?.trim() ?? "";
       typstCli = await invoke<string | null>("typst_cli_version");
     } catch (e) {

@@ -152,6 +152,8 @@ export interface LibrarySnapshot {
   defaultTypstStyleRelativePath?: string | null;
   /** Данные лежат в `<библиотека>/.reader` и синхронизируются вместе с книгами. */
   syncInLibrary?: boolean;
+  /** Книги, которые при этом сканировании были найдены под новым путём. */
+  relocated?: { from: string; to: string }[];
 }
 
 export const IMPORTANCE_OPTIONS: { value: Importance; label: string }[] = [

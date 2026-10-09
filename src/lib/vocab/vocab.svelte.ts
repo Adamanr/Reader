@@ -37,6 +37,18 @@ function persist() {
   writer.write(vocab.cards);
 }
 
+export function flushVocab(): Promise<void> {
+  return writer.flush();
+}
+
+/** Книга сменила путь (переименована/перенесена) — карточки слов ссылаются на новый. */
+export function relocateVocabBook(from: string, to: string) {
+  if (!vocab.loaded) return; // файл уже поправил бэкенд, загрузится свежим
+  if (!vocab.cards.some((c) => c.bookPath === from)) return;
+  vocab.cards = vocab.cards.map((c) => (c.bookPath === from ? { ...c, bookPath: to } : c));
+  persist();
+}
+
 export function hasWord(word: string): boolean {
   const w = word.trim().toLocaleLowerCase();
   return vocab.cards.some((c) => c.word.toLocaleLowerCase() === w);

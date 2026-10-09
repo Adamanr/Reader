@@ -62,8 +62,27 @@ function persist() {
   writer.write(stats.s);
 }
 
-export function flushStats() {
-  writer.flush();
+export function flushStats(): Promise<void> {
+  return writer.flush();
+}
+
+/** Книга сменила путь (переименована/перенесена) — переносим её статистику. */
+export function relocateStatsBook(from: string, to: string) {
+  if (!stats.loaded) return; // файл уже поправил бэкенд, загрузится свежим
+  const s = stats.s;
+  const books = { ...s.books };
+  if (books[from]) {
+    books[to] ??= books[from];
+    delete books[from];
+  }
+  const days: Record<string, DayStats> = {};
+  for (const [k, d] of Object.entries(s.days)) {
+    days[k] = d.books.includes(from)
+      ? { ...d, books: [...d.books.filter((b) => b !== from && b !== to), to] }
+      : d;
+  }
+  stats.s = { ...s, books, days };
+  persist();
 }
 
 const TICK_MS = 10_000;

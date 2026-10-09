@@ -3,8 +3,9 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { buildTranslatedPdf, loadBundledCyrillicFont } from "./buildTranslatedPdf";
 import { readLibraryBookBytes } from "$lib/library/readLibraryBookBytes";
 import { loadPdfBookTranslationFile } from "$lib/translate/pdfFullBookJob";
-import type { LibraryMetadata, LibrarySnapshot } from "$lib/types";
+import type { LibraryMetadata } from "$lib/types";
 import { effectiveShelfIds } from "$lib/library/shelves";
+import { fetchFreshLibrarySnapshot } from "$lib/library/librarySnapshotCache";
 
 function titleFromPath(path: string) {
   const i = path.lastIndexOf("/");
@@ -48,7 +49,7 @@ export async function exportTranslatedPdfToLibrary(bookRelativePath: string): Pr
     pdfBase64: bytesToBase64(bytes),
   });
 
-  const snap = await invoke<LibrarySnapshot>("get_library_snapshot");
+  const snap = await fetchFreshLibrarySnapshot();
   const src = snap.metadata.books[bookRelativePath];
   const nb = snap.metadata.books[newPath];
   if (nb && src) {

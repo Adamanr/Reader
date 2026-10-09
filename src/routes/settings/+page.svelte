@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
+  import BackupsCard from "$lib/components/BackupsCard.svelte";
   import SettingsThemeCard from "$lib/components/SettingsThemeCard.svelte";
   import TranslateSettingsCard from "$lib/components/TranslateSettingsCard.svelte";
   import TypstSettingsCard from "$lib/components/TypstSettingsCard.svelte";
@@ -17,7 +18,7 @@
       <div class="settings-heading">
         <span class="settings-kicker">Reader</span>
         <h1 class="settings-title">Настройки</h1>
-        <p>Оформление, синхронизация, помощник, озвучка, перевод и экспорт.</p>
+        <p>Оформление, синхронизация, помощник, озвучка, перевод, экспорт и резервные копии.</p>
       </div>
     </div>
   </header>
@@ -27,6 +28,7 @@
     <ReaderToolsSettingsCard />
     <TypstSettingsCard />
     <TranslateSettingsCard />
+    <BackupsCard />
   </main>
 </div>
 

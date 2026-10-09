@@ -43,13 +43,14 @@ export async function pathKey(path: string): Promise<string> {
 export function debouncedStoreWriter(name: string, delay = 800) {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let pending: unknown = undefined;
-  const flush = () => {
+  /** Промис завершается, когда отложенная запись дошла до диска. */
+  const flush = (): Promise<void> => {
     if (timer) clearTimeout(timer);
     timer = null;
-    if (pending === undefined) return;
+    if (pending === undefined) return Promise.resolve();
     const value = pending;
     pending = undefined;
-    void storeWrite(name, value).catch(() => {});
+    return storeWrite(name, value).catch(() => {});
   };
   return {
     write(value: unknown) {
