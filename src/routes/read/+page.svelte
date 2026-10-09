@@ -32,6 +32,7 @@
   import TypographyPanel from "$lib/components/TypographyPanel.svelte";
   import ReaderNotesPanel from "$lib/components/ReaderNotesPanel.svelte";
   import ReaderSearchPanel from "$lib/components/ReaderSearchPanel.svelte";
+  import ReaderMoreMenu from "$lib/components/reader/ReaderMoreMenu.svelte";
   import ReaderStatusBar from "$lib/components/ReaderStatusBar.svelte";
   import ReadingRuler from "$lib/components/ReadingRuler.svelte";
   import TtsBar from "$lib/components/TtsBar.svelte";
@@ -587,7 +588,6 @@
     finishNavigation();
   }
 
-  /** Переход из ленты заметок: `/read?path=…&hl=<id>` */
   /** Переход из поиска по библиотеке: `/read?path=…&q=<запрос>` — открываем поиск по книге. */
   let handledQ = "";
   $effect(() => {
@@ -598,6 +598,7 @@
     setPanel(true, "search");
   });
 
+  /** Переход из ленты заметок: `/read?path=…&hl=<id>` */
   let handledHl = "";
   $effect(() => {
     const id = page.url.searchParams.get("hl");
@@ -1038,79 +1039,22 @@
         <button type="button" class="icon-btn immersive-btn" title="Погружение (F)" aria-label="Режим погружения" onclick={() => toggleImmersive()}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /></svg>
         </button>
-        <div class="more-wrap">
-          <button
-            type="button"
-            class="icon-btn"
-            class:on={moreOpen}
-            title="Ещё"
-            aria-label="Ещё"
-            aria-expanded={moreOpen}
-            onclick={() => (moreOpen = !moreOpen)}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.3" /><circle cx="12" cy="12" r="1.3" /><circle cx="19" cy="12" r="1.3" /></svg>
-          </button>
-          {#if moreOpen}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="menu-back" onclick={() => (moreOpen = false)}></div>
-            <div class="menu" role="menu">
-              {#if fmt !== "typst"}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={() => {
-                    moreOpen = false;
-                    setPanel(true, "translate");
-                  }}>Перевод книги…</button
-                >
-              {/if}
-              {#if fmt !== "typst"}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={() => {
-                    moreOpen = false;
-                    recapOpen = true;
-                  }}>Ранее в книге… <kbd>без спойлеров</kbd></button
-                >
-                <button type="button" role="menuitem" onclick={toggleTts}>
-                  {tts.active ? "Остановить чтение вслух" : "Читать вслух"} <kbd>S</kbd>
-                </button>
-                <button type="button" role="menuitem" onclick={openRsvp}>Быстрое чтение (RSVP) <kbd>R</kbd></button>
-              {/if}
-              <button
-                type="button"
-                role="menuitem"
-                onclick={() => {
-                  moreOpen = false;
-                  ambientOpen = true;
-                }}
-              >
-                Фоновый звук… {#if ambient.current}<kbd>♪ {AMBIENT_OPTIONS.find((o) => o.id === ambient.current)?.label}</kbd>{/if}
-              </button>
-              <div class="menu-sep"></div>
-              <button type="button" role="menuitem" onclick={() => void toggleFullscreen()}>
-                {isFullscreen ? "Выйти из полного экрана" : "Во весь экран"} <kbd>F11</kbd>
-              </button>
-              {#if fmt !== "typst"}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={() => {
-                    moreOpen = false;
-                    void exportNotes();
-                  }}>Конспект в Markdown</button
-                >
-                <button type="button" role="menuitem" disabled={typstExportBusy} onclick={() => void exportCurrentBookToTypst()}>
-                  {typstExportBusy ? "Экспорт в Typst…" : "Экспорт в Typst"}
-                </button>
-              {/if}
-              <div class="menu-sep"></div>
-              <a role="menuitem" href="/settings">Настройки</a>
-            </div>
-          {/if}
-        </div>
+        <ReaderMoreMenu
+          bind:open={moreOpen}
+          format={fmt}
+          ttsActive={tts.active}
+          ambientLabel={ambient.current ? (AMBIENT_OPTIONS.find((o) => o.id === ambient.current)?.label ?? null) : null}
+          {isFullscreen}
+          {typstExportBusy}
+          onTranslate={() => setPanel(true, "translate")}
+          onRecap={() => (recapOpen = true)}
+          onToggleTts={toggleTts}
+          onRsvp={openRsvp}
+          onAmbient={() => (ambientOpen = true)}
+          onFullscreen={() => void toggleFullscreen()}
+          onExportNotes={() => void exportNotes()}
+          onExportTypst={() => void exportCurrentBookToTypst()}
+        />
       </div>
     </header>
 
@@ -1535,70 +1479,6 @@
     display: flex;
     align-items: center;
     gap: 0.15rem;
-  }
-
-  .more-wrap {
-    position: relative;
-  }
-
-  .menu-back {
-    position: fixed;
-    inset: 0;
-    z-index: 60;
-  }
-
-  .menu {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 0.4rem);
-    z-index: 61;
-    min-width: 15rem;
-    display: flex;
-    flex-direction: column;
-    padding: 0.35rem;
-    border-radius: var(--radius-md);
-    background: var(--panel-elevated);
-    border: 1px solid var(--toolbar-border);
-    box-shadow: var(--shadow-float);
-    animation: pop 0.14s ease-out;
-  }
-
-  .menu button,
-  .menu a {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    text-align: left;
-    border: none;
-    background: transparent;
-    color: var(--text-soft);
-    padding: 0.55rem 0.7rem;
-    border-radius: 10px;
-    font-size: 0.86rem;
-    cursor: pointer;
-    text-decoration: none;
-  }
-
-  .menu button:hover,
-  .menu a:hover {
-    background: var(--panel-soft);
-  }
-
-  .menu button:disabled {
-    opacity: 0.5;
-  }
-
-  .menu kbd {
-    font-size: 0.68rem;
-    color: var(--muted);
-    font-family: inherit;
-  }
-
-  .menu-sep {
-    height: 1px;
-    margin: 0.3rem 0.4rem;
-    background: var(--border-soft);
   }
 
   /* ——— Тело ——— */

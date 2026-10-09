@@ -5,7 +5,6 @@
   import { commands } from "$lib/bindings";
   import { listen } from "@tauri-apps/api/event";
   import type { BookMeta, LibraryMetadata, LibrarySnapshot, ReadingStatus, Shelf } from "$lib/types";
-  import { READING_STATUS_OPTIONS } from "$lib/types";
   import { getBookFormat } from "$lib/bookFormat";
   import { bookOnShelf, effectiveShelfIds } from "$lib/library/shelves";
   import {
@@ -36,6 +35,8 @@
   import HomeSidebar from "$lib/components/home/HomeSidebar.svelte";
   import HomeHero from "$lib/components/home/HomeHero.svelte";
   import Book3D from "$lib/components/home/Book3D.svelte";
+  import BookActionConfirm from "$lib/components/home/BookActionConfirm.svelte";
+  import BookContextMenu from "$lib/components/home/BookContextMenu.svelte";
   import BookEditDialog from "$lib/components/home/BookEditDialog.svelte";
   import SpineShelf from "$lib/components/SpineShelf.svelte";
   import BookFullTranslateModal from "$lib/components/BookFullTranslateModal.svelte";
@@ -700,42 +701,35 @@
 
 {#if ctxMenu}
   {@const cm = ctxMenu}
-  {@const cmMeta = snapshot?.metadata.books[cm.path]}
-  {@const cmFmt = getBookFormat(cm.path)}
-  <div id="ctx-menu" class="ctx" style="left:{cm.x}px;top:{cm.y}px" role="menu">
-    <p class="ctx-title">{bookTitle(cm.path, cmMeta)}</p>
-    {#if bookIsHidden(cm.path)}
-      <button type="button" role="menuitem" onclick={() => void restoreBookFromMenu()}>Вернуть на полку</button>
-      <div class="sep"></div>
-      <button type="button" role="menuitem" class="danger" onclick={() => startBookAction("delete")}>Удалить файл…</button>
-    {:else}
-      <button type="button" role="menuitem" onclick={() => { openBook(cm.path); closeCtx(); }}>Читать</button>
-      <button type="button" role="menuitem" onclick={() => { editPath = cm.path; closeCtx(); }}>Изменить сведения…</button>
-      <div class="sep"></div>
-      <p class="ctx-label">Статус</p>
-      <div class="ctx-status">
-        {#each READING_STATUS_OPTIONS as o (o.value)}
-          <button
-            type="button"
-            class:on={cmMeta?.status === o.value}
-            onclick={() => {
-              setBookStatus(cm.path, o.value);
-              closeCtx();
-            }}>{o.label}</button
-          >
-        {/each}
-      </div>
-      <div class="sep"></div>
-      {#if isTauriRuntime() && cmFmt === "pdf"}
-        <button type="button" role="menuitem" onclick={() => { fullTranslateBook = cm.path; closeCtx(); }}>Перевести книгу…</button>
-      {/if}
-      {#if isTauriRuntime() && cmFmt && cmFmt !== "typst"}
-        <button type="button" role="menuitem" onclick={() => void exportBookToTypstFromMenu()}>Экспорт в Typst…</button>
-      {/if}
-      <button type="button" role="menuitem" onclick={() => startBookAction("hide")}>Убрать с полок</button>
-      <button type="button" role="menuitem" class="danger" onclick={() => startBookAction("delete")}>Удалить файл…</button>
-    {/if}
-  </div>
+  <BookContextMenu
+    x={cm.x}
+    y={cm.y}
+    title={bookTitle(cm.path, snapshot?.metadata.books[cm.path])}
+    status={snapshot?.metadata.books[cm.path]?.status ?? null}
+    format={getBookFormat(cm.path)}
+    hidden={bookIsHidden(cm.path)}
+    canTranslate={isTauriRuntime()}
+    onRead={() => {
+      openBook(cm.path);
+      closeCtx();
+    }}
+    onEdit={() => {
+      editPath = cm.path;
+      closeCtx();
+    }}
+    onStatus={(st) => {
+      setBookStatus(cm.path, st);
+      closeCtx();
+    }}
+    onTranslate={() => {
+      fullTranslateBook = cm.path;
+      closeCtx();
+    }}
+    onExportTypst={() => void exportBookToTypstFromMenu()}
+    onRestore={() => void restoreBookFromMenu()}
+    onHide={() => startBookAction("hide")}
+    onDelete={() => startBookAction("delete")}
+  />
 {/if}
 
 {#if editPath && editMeta}
@@ -761,31 +755,15 @@
 {/if}
 
 {#if bookAction}
-  {@const ba = bookAction}
-  {@const baMeta = snapshot?.metadata.books[ba.path]}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="confirm-back" onclick={closeBookAction}>
-    <div class="confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" tabindex="-1" onclick={(e) => e.stopPropagation()}>
-      <div class="confirm-book"><Book3D path={ba.path} meta={baMeta} eager compact tilt={false} /></div>
-      <div class="confirm-body">
-        <h2 id="confirm-title">{ba.kind === "delete" ? "Удалить книгу с диска?" : "Убрать книгу с полок?"}</h2>
-        <p class="confirm-name">{bookTitle(ba.path, baMeta)}</p>
-        <p class="confirm-copy">
-          {ba.kind === "delete"
-            ? "Файл будет удалён безвозвратно вместе с прогрессом и заметками."
-            : "Файл останется на диске. Вернуть книгу можно из раздела «Скрытые»."}
-        </p>
-        {#if bookActionError}<p class="confirm-error" role="alert">{bookActionError}</p>{/if}
-        <div class="confirm-actions">
-          <button type="button" class="ghost" onclick={closeBookAction} disabled={bookActionBusy}>Отмена</button>
-          <button type="button" class="solid" class:danger={ba.kind === "delete"} onclick={() => void confirmBookAction()} disabled={bookActionBusy}>
-            {bookActionBusy ? "Подождите…" : ba.kind === "delete" ? "Удалить" : "Убрать"}
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
+  <BookActionConfirm
+    kind={bookAction.kind}
+    path={bookAction.path}
+    meta={snapshot?.metadata.books[bookAction.path]}
+    busy={bookActionBusy}
+    error={bookActionError}
+    onCancel={closeBookAction}
+    onConfirm={() => void confirmBookAction()}
+  />
 {/if}
 
 <style>
@@ -1349,8 +1327,7 @@
     margin: 0 0 0.3rem;
   }
 
-  .ghost,
-  .solid {
+  .ghost {
     margin-top: 0.8rem;
     padding: 0.55rem 1.1rem;
     border-radius: 999px;
@@ -1359,19 +1336,6 @@
     color: var(--text-soft);
     font: inherit;
     cursor: pointer;
-  }
-
-  .solid {
-    background: var(--text-soft);
-    border-color: var(--text-soft);
-    color: var(--bg-soft);
-    font-weight: 600;
-  }
-
-  .solid.danger {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: #fff;
   }
 
   /* ——— Перетаскивание ——— */
@@ -1417,152 +1381,6 @@
 
   .drop-card small {
     color: var(--muted);
-  }
-
-  /* ——— Контекстное меню ——— */
-  .ctx {
-    position: fixed;
-    z-index: 800;
-    width: 15rem;
-    padding: 0.4rem;
-    border-radius: 1rem;
-    background: var(--panel-elevated);
-    border: 1px solid color-mix(in srgb, var(--border-soft) 80%, transparent);
-    box-shadow: var(--shadow-float);
-    display: flex;
-    flex-direction: column;
-    animation: pop 0.14s ease-out;
-  }
-
-  .ctx-title {
-    margin: 0;
-    padding: 0.45rem 0.7rem 0.5rem;
-    font-family: "Literata Variable", Georgia, serif;
-    font-weight: 600;
-    font-size: 0.9rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .ctx-label {
-    margin: 0;
-    padding: 0.2rem 0.7rem;
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--muted);
-  }
-
-  .ctx > button {
-    border: none;
-    background: transparent;
-    color: var(--text-soft);
-    text-align: left;
-    padding: 0.5rem 0.7rem;
-    border-radius: 0.6rem;
-    font: inherit;
-    font-size: 0.88rem;
-    cursor: pointer;
-  }
-
-  .ctx > button:hover {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-
-  .ctx > button.danger {
-    color: var(--danger);
-  }
-
-  .ctx-status {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.25rem;
-    padding: 0.2rem 0.4rem 0.3rem;
-  }
-
-  .ctx-status button {
-    border: 1px solid var(--border-soft);
-    background: transparent;
-    color: var(--text-soft);
-    border-radius: 0.55rem;
-    padding: 0.35rem 0.3rem;
-    font: inherit;
-    font-size: 0.74rem;
-    cursor: pointer;
-  }
-
-  .ctx-status button.on {
-    background: var(--text-soft);
-    border-color: var(--text-soft);
-    color: var(--bg-soft);
-  }
-
-  .sep {
-    height: 1px;
-    margin: 0.3rem 0.5rem;
-    background: color-mix(in srgb, var(--border-soft) 80%, transparent);
-  }
-
-  /* ——— Подтверждение ——— */
-  .confirm-back {
-    position: fixed;
-    inset: 0;
-    z-index: 900;
-    display: grid;
-    place-items: center;
-    padding: 1rem;
-    background: rgba(20, 14, 30, 0.38);
-    backdrop-filter: blur(6px);
-    animation: fade 0.18s ease-out;
-  }
-
-  .confirm {
-    width: min(30rem, 100%);
-    display: flex;
-    gap: 1.4rem;
-    padding: 1.6rem;
-    border-radius: 1.5rem;
-    background: var(--panel-elevated);
-    box-shadow: var(--shadow-float);
-    animation: pop 0.18s ease-out;
-  }
-
-  .confirm-book {
-    width: 5.2rem;
-    flex-shrink: 0;
-  }
-
-  .confirm-body h2 {
-    margin: 0;
-    font-family: "Literata Variable", Georgia, serif;
-    font-weight: 500;
-    font-size: 1.3rem;
-  }
-
-  .confirm-name {
-    margin: 0.4rem 0 0;
-    font-weight: 600;
-  }
-
-  .confirm-copy {
-    margin: 0.5rem 0 0;
-    color: var(--muted);
-    font-size: 0.9rem;
-    line-height: 1.5;
-  }
-
-  .confirm-error {
-    margin: 0.6rem 0 0;
-    color: var(--danger);
-    font-size: 0.86rem;
-  }
-
-  .confirm-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.5rem;
-    margin-top: 0.6rem;
   }
 
   .sr-only {
