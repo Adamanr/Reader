@@ -29,6 +29,7 @@
 
   const NAV = [
     { href: "/", label: "Библиотека", icon: "M4 19V6a2 2 0 0 1 2-2h3v15M9 4h4v15M13 6l3.5-1 3 13.5-3.5 1" },
+    { href: "/search", label: "Поиск", icon: "M10.5 17a6.5 6.5 0 1 1 0-13 6.5 6.5 0 0 1 0 13zM15.2 15.2L20 20" },
     { href: "/sources", label: "Источники", icon: "M12 3v12m0 0l4-4m-4 4l-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" },
     { href: "/notes", label: "Заметки", icon: "M6 4h9l3 3v13H6zM9 11h6M9 15h4" },
     { href: "/words", label: "Мои слова", icon: "M4 19l4.5-12h1L14 19M6 14h6M15 11h5M17.5 8.5v5" },

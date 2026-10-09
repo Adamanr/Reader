@@ -588,6 +588,16 @@
   }
 
   /** Переход из ленты заметок: `/read?path=…&hl=<id>` */
+  /** Переход из поиска по библиотеке: `/read?path=…&q=<запрос>` — открываем поиск по книге. */
+  let handledQ = "";
+  $effect(() => {
+    const q = page.url.searchParams.get("q")?.trim() ?? "";
+    if (!q || !navApi || handledQ === q) return;
+    handledQ = q;
+    searchSeed = q;
+    setPanel(true, "search");
+  });
+
   let handledHl = "";
   $effect(() => {
     const id = page.url.searchParams.get("hl");
